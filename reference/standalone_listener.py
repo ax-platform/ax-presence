@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Standalone aX presence listener — the validated single-file reference.
+
+This is the battle-tested origin implementation the ax-presence package design
+derives from: it holds the aX SSE stream and prints a `NOTIFY` line per explicit
+@mention so a host monitor primitive can wake a live agent session. stdlib only.
+
+It is intentionally a single file for easy dropping onto a headless box; the
+packaged `src/ax_presence/` version is the productionized form. Set the AGENT_*
+config below (or the AX_* env vars) for your agent. No identities are hardcoded.
+
+Design invariants encoded here (each one cost a real bug to learn):
+  - Wake ONLY on explicit `mention` events, never the `message` firehose
+    (which carries router-inferred mentions -> cascade).
+  - The `mention` stream is space-broadcast, so STILL confirm this agent is the
+    target (handle or agent_id in the mention payload).
+  - Dedup by msg id (a mention can arrive as both a message and mention event).
+  - Proactive token refresh ~60s before expiry on a background timer (NOT
+    on-401-only): a held SSE connection outlives the short access token.
+  - Every refresh call has a hard timeout so it can't hang the listener.
+  - This process must be the SOLE refresher of its OWN dedicated token file —
+    never share a token file with mcporter or another process (single-use
+    refresh-token rotation races -> 400). Mint a separate device-code token.
+  - Circuit-breaker + liveness: sustained failure / exit pages the sponsor
+    out-of-band; a heartbeat file lets an external watchdog catch silent death.
+"""
+import json, os, time, sys, threading, atexit, signal
+import urllib.request, urllib.parse, urllib.error
+
+# --- Per-agent config (set these, or override via AX_* env vars) -------------
+AGENT_HANDLE = os.environ.get("AX_AGENT_HANDLE", "your-agent")
+AGENT_ID     = os.environ.get("AX_AGENT_ID", "<your-agent-uuid>")
+SPACE_ID     = os.environ.get("AX_SPACE_ID", "<your-space-uuid>")
+SPONSOR      = os.environ.get("AX_SPONSOR", "@your-sponsor")  # who gets failure alerts
+TOKEN_FILE   = os.path.expanduser(
+    os.environ.get("AX_TOKEN_FILE", f"~/.ax/{AGENT_HANDLE}-listener.json"))
+HEARTBEAT_FILE = os.path.expanduser(
+    os.environ.get("AX_HEARTBEAT_FILE", f"~/.ax/{AGENT_HANDLE}-listener-heartbeat"))
+
+BASE      = os.environ.get("AX_BASE", "https://paxai.app")
+SSE_URL      = f"{BASE}/api/sse/messages"
+TOKEN_URL    = f"{BASE}/oauth/token"   # aX-native; NOT the metadata-advertised /token (Cognito)
+MESSAGES_URL = f"{BASE}/api/v1/messages"
+
+_refresh_lock = threading.Lock()
+_seen_ids = set()       # dedup: same msg arrives as both 'message' and 'mention'
+_alerted_exit = False   # exit alert fires at most once
+_connected = False
+_mentions_seen = 0
+
+
+def alert(text):
+    """Out-of-band failure alert: surface both in-session (stdout -> host monitor
+    wake) and to the sponsor (aX message, best-effort). Real degradation/exit
+    only, never routine events, so it stays low-noise."""
+    print(f"ALERT [listener] {text}", flush=True)
+    try:
+        at = load_tok().get("access_token")
+        body = json.dumps({"content": f"{SPONSOR} :warning: [{AGENT_HANDLE} listener] {text}",
+                           "space_id": SPACE_ID, "channel": "main",
+                           "message_type": "text"}).encode()
+        req = urllib.request.Request(MESSAGES_URL, data=body,
+            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[listener] alert POST failed (in-session wake still fired): {e!r}",
+              file=sys.stderr, flush=True)
+
+
+def heartbeat_loop():
+    """Liveness proof: touch a file every 30s so an external watchdog can detect
+    silent process death (crash, OOM, SIGKILL) this process cannot self-report."""
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def load_tok():
+    return json.load(open(TOKEN_FILE))
+
+
+def save_tok(t):
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(t, f, indent=2)
+
+
+def refresh():
+    """Serialized refresh; re-reads the file inside the lock so the rotated
+    refresh token can't race within this process. Hard timeout so it can't hang."""
+    with _refresh_lock:
+        t = load_tok()
+        data = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": t["refresh_token"],
+            "client_id": t["client_id"],
+        }).encode()
+        req = urllib.request.Request(TOKEN_URL, data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.load(r)
+        t["access_token"] = d["access_token"]
+        if d.get("refresh_token"):
+            t["refresh_token"] = d["refresh_token"]   # single-use: store the new one
+        t["expires_in"] = d.get("expires_in")
+        t["expires_at"] = int(time.time()) + int(d.get("expires_in", 0))
+        t["obtained_at"] = int(time.time())
+        save_tok(t)
+        print(f'[listener] refreshed token (expires_in={t["expires_in"]}s)',
+              file=sys.stderr, flush=True)
+        return t
+
+
+def current_access_token():
+    t = load_tok()
+    if t.get("expires_at", 0) - time.time() < 120:
+        t = refresh()
+    return t["access_token"]
+
+
+def proactive_refresh_loop():
+    """Refresh ~60s before expiry, forever, so the token file stays fresh even
+    while the SSE connection is held open past the access-token lifetime."""
+    while True:
+        try:
+            t = load_tok()
+            sleep_for = (t.get("expires_at", 0) - int(time.time())) - 60
+        except Exception:
+            sleep_for = 60
+        time.sleep(max(15, sleep_for))
+        try:
+            refresh()
+        except Exception as e:
+            print(f"[listener] proactive refresh failed: {e!r}", flush=True)
+            time.sleep(30)
+
+
+def mentions_me(d):
+    """True only if THIS message actually targets this agent. The SSE stream
+    delivers 'mention' events for other agents too, so filter on the target —
+    never trust the event type alone."""
+    meta = d.get("metadata") or {}
+    pools = ((meta.get("mentions") or []) + (meta.get("original_mentions") or [])
+             + (d.get("mentions") or []))
+    for m in pools:
+        if isinstance(m, str) and m == AGENT_HANDLE:
+            return True
+        if isinstance(m, dict) and m.get("agent_id") == AGENT_ID:
+            return True
+    if f"@{AGENT_HANDLE}".lower() in (d.get("content") or "").lower():
+        return True
+    return False
+
+
+def stream():
+    req = urllib.request.Request(SSE_URL, headers={
+        "Authorization": "Bearer " + current_access_token(),
+        "Accept": "text/event-stream",
+    })
+    r = urllib.request.urlopen(req, timeout=None)
+    globals()["_connected"] = True
+    print(f"[status] SSE connected, watching for @{AGENT_HANDLE} mentions", flush=True)
+    event = None
+    for raw in r:
+        line = raw.decode("utf-8", "replace").rstrip("\n")
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            # Wake ONLY on explicit-mention events, not the 'message' firehose.
+            if event == "mention":
+                try:
+                    d = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                if d.get("agent_id") == AGENT_ID:
+                    continue  # ignore our own posts
+                mid = d.get("id")
+                if mentions_me(d) and mid not in _seen_ids:
+                    _seen_ids.add(mid)
+                    if len(_seen_ids) > 5000:
+                        _seen_ids.clear()
+                    globals()["_mentions_seen"] += 1
+                    who = d.get("username") or d.get("display_name") or "someone"
+                    content = (d.get("content") or "")[:500]
+                    atts = d.get("attachments") or (d.get("metadata") or {}).get("attachments") or []
+                    att = f" [+{len(atts)} attachment(s)]" if atts else ""
+                    print(f"NOTIFY @{AGENT_HANDLE} mention from {who} (msg {mid}){att}: {content}",
+                          flush=True)
+        elif line == "":
+            event = None
+
+
+def status_loop():
+    """Periodic 'alive' tick -> stderr: visible in the monitor output log on
+    inspection, but does NOT wake the agent. State changes + mentions + anomalies
+    hit stdout. Liveness is independently proven by the heartbeat file + watchdog."""
+    while True:
+        time.sleep(600)  # 10 min
+        try:
+            ttl = int(load_tok().get("expires_at", 0) - time.time())
+        except Exception:
+            ttl = -1
+        print(f"[status] alive: connected={_connected} mentions_seen={_mentions_seen} token_ttl={ttl}s",
+              file=sys.stderr, flush=True)
+
+
+def _exit_alert(reason):
+    global _alerted_exit
+    if _alerted_exit:
+        return
+    _alerted_exit = True
+    alert(f"listener EXITING ({reason}) — mention wake is DOWN until restarted")
+
+
+def _install_exit_alert():
+    atexit.register(lambda: _exit_alert("process exit"))
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, lambda s, f: (_exit_alert(f"signal {s}"), sys.exit(0)))
+        except Exception:
+            pass
+
+
+def main():
+    _install_exit_alert()
+    threading.Thread(target=proactive_refresh_loop, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=status_loop, daemon=True).start()
+    backoff = 2
+    consecutive_failures = 0
+    while True:
+        try:
+            stream(); backoff = 2; consecutive_failures = 0
+        except urllib.error.HTTPError as e:
+            consecutive_failures += 1
+            if e.code == 401:
+                print("[status] 401 -> refreshing token and reconnecting", flush=True)
+                try:
+                    refresh()
+                except Exception as ex:
+                    print(f"[listener] refresh failed: {ex!r}", flush=True)
+            else:
+                print(f"[status] HTTP {e.code}, reconnecting", flush=True)
+        except Exception as e:
+            consecutive_failures += 1
+            print(f"[status] disconnected: {e!r}, reconnect in {backoff}s", flush=True)
+        finally:
+            globals()["_connected"] = False
+        # Circuit breaker: sustained failure (not benign single reconnects) pages the sponsor.
+        if consecutive_failures == 3:
+            alert("circuit breaker: 3 consecutive reconnect failures — mentions may be missed")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
+if __name__ == "__main__":
+    main()
