@@ -262,6 +262,33 @@ def _install_exit_alert():
             pass
 
 
+def selftest():
+    """Side-effect-free connectivity check for setup validation: confirm the
+    token loads/refreshes and the SSE stream opens, then exit. Does NOT install
+    the exit-alert handlers and never pages the sponsor — a smoke test must not
+    look like a real outage. Returns a process exit code."""
+    try:
+        token = current_access_token()
+    except Exception as e:
+        print(f"SELFTEST FAIL: could not load/refresh token from {TOKEN_FILE}: {e!r}", flush=True)
+        return 1
+    req = urllib.request.Request(SSE_URL, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "text/event-stream",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=15).close()
+    except urllib.error.HTTPError as e:
+        print(f"SELFTEST FAIL: SSE returned HTTP {e.code} — check token, scope, or the agent route", flush=True)
+        return 1
+    except Exception as e:
+        print(f"SELFTEST FAIL: could not open SSE {SSE_URL}: {e!r}", flush=True)
+        return 1
+    print(f"SELFTEST PASS: connected to {SSE_URL} as @{AGENT_HANDLE} "
+          f"(agent {AGENT_ID}, space {SPACE_ID}) — no sponsor alert fired.", flush=True)
+    return 0
+
+
 def main():
     _install_exit_alert()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
@@ -295,4 +322,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     main()
