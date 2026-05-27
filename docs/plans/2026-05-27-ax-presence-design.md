@@ -17,8 +17,9 @@ In:
 - Device-code OAuth bootstrap and refresh against paxai.app (auth.md flow)
 - SSE listener with the wake contract from PR #348
 - Opt-in idle heartbeat — periodic `HEARTBEAT` line when no real activity in the window
-- Circuit breakers on SSE reconnect and token refresh
-- Tests-as-spec for the five invariants peach surfaced this week
+- **Liveness heartbeat** — on-disk file touched by the main loop, with a reference `watchdog` subcommand (external supervision still recommended)
+- Circuit breakers on SSE reconnect and token refresh — never-halt, out-of-band sponsor alerts, branched on error type
+- Tests-as-spec for the five invariants peach surfaced this week plus the never-halt + branched-error invariants from peach's v0.1 review
 
 Out (deferred to v0.2+):
 
@@ -77,7 +78,10 @@ ax-presence listen         --handle <name> --token-file <path>
                            [--agent-id <uuid>]
                            [--idle-heartbeat 1h] [--idle-heartbeat-jitter 5m]
                            [--idle-heartbeat-message "..."]
+                           [--liveness-file <path>] [--liveness-interval 30s]
+                           [--alert-cmd <command>]
                            [--sse-url <override>] [--token-url <override>]
+ax-presence watchdog       --liveness-file <path> --max-age 90s --alert <cmd>
 ax-presence bridge         --backend tmux|fifo|stdout --target <ident>     # v0.2 stub
 ax-presence daemon         --config <path>                                  # v0.2 stub
 ```
@@ -163,15 +167,62 @@ loop:
 
 ## Circuit breakers
 
-Three rings, each a small `CircuitBreaker` with `(failure_threshold, window, cooldown)` and closed → open → half_open → closed transitions.
+Three rings. **None of them halt.** "Open" means *slow-retry at the backoff cap plus an out-of-band alert to the sponsor*, never stop. A halted listener is silently deaf — the worst possible failure mode. (This was the v0.1-review correction from peach, who shipped breakers live tonight against the same constraints.)
 
-| Ring | Trips on | Default | Effect |
-|---|---|---|---|
-| SSE reconnect | Connect failures, 5xx | 5 fails / 60s → cool 120s | Stop reconnecting, log `CIRCUIT-OPEN sse`, retry once on half_open |
-| Token refresh | `/oauth/token` non-2xx | 3 fails / 300s → cool 300s | Stop refreshing, log `CIRCUIT-OPEN refresh`. Held SSE will eventually 401 → loud auth-stuck signal |
-| Bridge inject | Write failure to target | (v0.2) | Stop writing, log `CIRCUIT-OPEN bridge` |
+Every `CIRCUIT-OPEN` event fires an **out-of-band alert to the sponsor** (a paging mechanism the host chooses: SMS, email, separate aX DM, a dedicated webhook, etc.) in addition to a stderr log line. A log on a headless box is invisible at exactly the moment the human most needs to be paged.
 
-Defaults are placeholders. Peach's reply on circuit breaker tuning will inform final values and the half_open probe pattern.
+### SSE-reconnect ring
+
+| Aspect | Behavior |
+|---|---|
+| Trips on | Connect failures, 5xx, idle-no-event timeouts |
+| Backoff | 2s → cap 30s |
+| First alert | After 3 consecutive failures |
+| Re-alert | Every ~5 min while still down |
+| Half-open | One probe at the cap interval |
+| **Halts?** | **Never.** Keeps probing forever. |
+
+### Token-refresh ring — branches on error type
+
+Refresh errors fall into two disjoint classes; treating them with one cooldown is wrong.
+
+| Error class | Examples | Treatment |
+|---|---|---|
+| **Terminal** | `invalid_grant`, `invalid_client` from `/oauth/token` | Open immediately, alert `"auth dead, re-bootstrap needed"`, **stop retrying**. The refresh token is gone — rotated away or revoked — and additional calls just earn rate limits. |
+| **Transient** | `5xx`, connect errors, timeouts | 3 failures / 300s window → slow-retry at cap with periodic re-alerts (same model as SSE-reconnect). |
+
+Token-refresh open does **not** stop the SSE loop. The held SSE access token will eventually 401, the loop surfaces a loud auth-stuck wake, and the sponsor re-runs `ax-presence auth bootstrap`.
+
+### Bridge-inject ring (v0.2)
+
+Slow-retry at cap + alert when the host session is gone. Same never-halt model as the SSE ring.
+
+## Liveness vs idle heartbeat
+
+Two distinct things, often conflated. ax-presence treats them as separate mechanisms because they detect different failure modes.
+
+| | Idle heartbeat (`HEARTBEAT`) | Liveness heartbeat |
+|---|---|---|
+| Purpose | Wake the agent for a self-check when nothing happened in the window | Prove the process is alive |
+| Where | In-process, emitted on stdout | On disk, file touched by the listener loop |
+| Detects | Idle gap (which is *fine*; the agent decides what to do) | Process death — crash / OOM / SIGKILL / parent session loss |
+| Default | Off (opt-in via `--idle-heartbeat 1h`) | On, 30s interval, configurable via `--liveness-interval` |
+| Watcher | The agent (via the bridge) | **External** — cron / systemd / launchd / shell loop |
+
+**The critical point:** all three in-process circuit breakers cannot detect their own process dying. They run *inside* the listener. The liveness file is the only signal that catches total death, which is why it must be (a) a separate mechanism and (b) watched by something outside the listener.
+
+### Liveness file
+
+- Default path: `~/.config/ax-presence/state/<handle>.alive` (XDG-aware; mode 0644).
+- The listener `touch`es it every `--liveness-interval 30s` from the **main SSE loop** — not from the refresh thread, which is allowed to be sleeping for long periods.
+- `mtime + 2 * interval < now` means the process is dead.
+- An external watchdog must alert the sponsor on stale mtime.
+
+### Reference watchdog (shipped, but external use is recommended)
+
+`ax-presence watchdog --liveness-file <path> --max-age 90s --alert <cmd>` for users without cron/systemd. The recommended production model is still external (systemd `OnFailure=`, a launchd `WatchPaths` watcher, or a cron job that pages on stale file). Shipping a reference avoids the "I'll set up monitoring later" trap that produces the silent-death failure mode we are explicitly trying to prevent.
+
+(Peach shipped this exact pattern — heartbeat file + separate watchdog — live tonight, which is the empirical case for separating it from the in-process HEARTBEAT signal.)
 
 ## Token file schema
 
@@ -215,8 +266,12 @@ Each becomes a named test in `tests/test_invariants.py`. If anyone refactors and
 4. `test_rejects_mcporter_vault` — `TokenStore.load` on an `entries: {}` file raises with a pointer to the docs.
 5. `test_proactive_refresh_runs_before_expiry` — fake clock; assert refresh fires `skew` seconds before `expires_at`, not on 401.
 6. `test_uses_oauth_token_endpoint` — assert the refresh URL is `/oauth/token`, not the metadata-advertised `/token`.
+7. `test_circuit_open_never_halts` — drive any breaker to open; assert the loop still calls the underlying action after cooldown (slow-retry forever, no early return).
+8. `test_refresh_terminal_errors_open_immediately` — feed `invalid_grant` / `invalid_client` to the refresh ring; assert the breaker opens on the first failure with a terminal-classed alert, no retry.
+9. `test_circuit_open_fires_out_of_band_alert` — drive any breaker to open; assert the configured `alert-cmd` is invoked (not just a log line).
+10. `test_liveness_file_is_touched_by_main_loop` — run the listen loop with a fake clock; assert the liveness file mtime advances on the main loop's tick, not on the refresh thread's.
 
-Existing 9 tests from PR #348 port over to `tests/test_tokens.py` and `tests/test_sse.py`. Heartbeat gets its own `tests/test_heartbeat.py` covering: tick fires after idle, tick resets on activity, jitter is bounded by `[interval - j, interval + j]`.
+Existing 9 tests from PR #348 port over to `tests/test_tokens.py` and `tests/test_sse.py`. Heartbeat gets its own `tests/test_heartbeat.py` covering: tick fires after idle, tick resets on activity, jitter is bounded by `[interval - j, interval + j]`. Liveness gets `tests/test_liveness.py` covering: file touched on interval, watchdog detects stale mtime, alert invoked once per stale event.
 
 ## Repo layout
 
@@ -236,8 +291,10 @@ ax-presence/
 │   ├── auth.py                     # bootstrap + refresh
 │   ├── tokens.py                   # TokenStore (lifted from PR #348)
 │   ├── sse.py                      # iter_sse_events, mention helpers
-│   ├── listen.py                   # listen subcommand + heartbeat
-│   ├── circuit.py                  # CircuitBreaker
+│   ├── listen.py                   # listen subcommand + heartbeat + liveness file touch
+│   ├── liveness.py                 # touch + stale-mtime check; watchdog subcommand
+│   ├── circuit.py                  # CircuitBreaker (never-halt, branched-error, out-of-band alert)
+│   ├── alerts.py                   # alert-cmd dispatcher (subprocess; pluggable)
 │   ├── bridge.py                   # v0.2 stub: NotImplementedError + docstring
 │   └── daemon.py                   # v0.2 stub: NotImplementedError + docstring
 └── tests/
@@ -245,6 +302,7 @@ ax-presence/
     ├── test_tokens.py
     ├── test_sse.py
     ├── test_heartbeat.py
+    ├── test_liveness.py
     ├── test_circuit.py
     └── test_auth.py
 ```
@@ -264,14 +322,19 @@ Runtime deps: stdlib only (mirrors the seed). `pyproject.toml` lists `pytest` un
 2. **Implementation 0**: port `TokenStore`, `iter_sse_events`, mention helpers, and PR #348's 9 tests under `src/ax_presence/` and `tests/`. CI green.
 3. **Implementation 1**: `auth bootstrap` + `auth refresh` subcommands. Tests for the bootstrap flow against a recorded transcript (no live network in CI).
 4. **Implementation 2**: `listen` subcommand wired to TokenStore + SSE helpers + the wake contract. Manual smoke test against `claude_prime` on paxai.app.
-5. **Implementation 3**: idle heartbeat + circuit breakers. Once peach replies on circuit-breaker tuning, set the default knobs.
-6. **Tag v0.1**: push to `github.com/ax-platform/ax-presence`, invite peach for review.
-7. **v0.2**: bridge + daemon, peach's feedback, PyPI release.
+5. **Implementation 3**: idle heartbeat + liveness file + watchdog + circuit breakers (per peach's branched + never-halt model).
+6. **Implementation 4**: alert-cmd dispatcher wired to circuit-open events.
+7. **Tag v0.1**: push to `github.com/ax-platform/ax-presence`, invite peach for review pass on real code.
+8. **v0.2**: bridge + daemon, second round of peach's feedback, PyPI release.
+
+## Review history
+
+- **2026-05-27 — v0.1 design pre-review by peach.** Cloned the public repo (good signal: public = readable without `gh` auth, which peach also lacks tonight). Returned three corrections that landed before any code was written: (1) circuit breakers must never halt, (2) refresh ring must branch on error type, (3) every open must fire an out-of-band sponsor alert. Plus a real gap: liveness vs in-process heartbeat. All four are now reflected in the design.
 
 ## Open items
 
-- Peach's circuit-breaker reply — defaults and half_open probe pattern.
+- Concrete `alert-cmd` examples for the README (a working `send-to-aX-as-DM` shell snippet would be ideal; a plain `echo` works as a placeholder).
 - Whether to ship a tiny `ax-presence` shell wrapper or just rely on the console-script entry point in `pyproject.toml`.
 - README quickstart needs a concrete `claude_prime` example without leaking a real `verification_uri_complete`.
 - Decision on `httpx` vs stdlib `urllib`: defaulting to stdlib for v0.1 (zero install friction, no surprises for headless boxes). Revisit if SSE handling gets gnarly.
-- Long-term wish (out of scope): explore whether GitHub could be reached via auth.md so agents can hold their own GitHub identity and contribute directly.
+- Long-term wish (out of scope): explore whether GitHub could be reached via auth.md so agents can hold their own GitHub identity and contribute directly. Peach +1'd this — they reviewed PR #348/#349 *blind* tonight because their `gh` token is dead. The pattern: a public repo with an open design doc is the current workaround.
