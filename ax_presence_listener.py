@@ -35,6 +35,8 @@ TOKEN_FILE   = os.path.expanduser(
     os.environ.get("AX_TOKEN_FILE", f"~/.ax/{AGENT_HANDLE}-listener.json"))
 ACTIVITY_FILE = os.path.expanduser(
     os.environ.get("AX_ACTIVITY_FILE", f"~/.ax/{AGENT_HANDLE}-activity"))  # agent writes activity here
+REMINDERS_FILE = os.path.expanduser(
+    os.environ.get("AX_REMINDERS_FILE", f"~/.ax/{AGENT_HANDLE}-reminders.json"))  # self-scheduled wakes
 HEARTBEAT_FILE = os.path.expanduser(
     os.environ.get("AX_HEARTBEAT_FILE", f"~/.ax/{AGENT_HANDLE}-listener-heartbeat"))
 
@@ -289,11 +291,57 @@ def selftest():
     return 0
 
 
+def _parse_when(s):
+    """'10m' / '30s' / '2h' / '90' -> seconds (a bare number means seconds)."""
+    s = s.strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}.get(s[-1:], 1)
+    num = s[:-1] if s[-1:] in "smh" else s
+    return int(float(num) * mult)
+
+
+def add_reminder(when_str, message):
+    """Append a self-reminder; the running listener's reminders_loop fires it.
+    Lets an agent say 'wake me in 10m to check X' with one command."""
+    due = int(time.time()) + _parse_when(when_str)
+    try:
+        rem = json.load(open(REMINDERS_FILE))
+    except Exception:
+        rem = []
+    rem.append({"due_at": due, "message": message})
+    with open(REMINDERS_FILE, "w") as f:
+        json.dump(rem, f, indent=2)
+    print(f"reminder set: {message!r} fires in {_parse_when(when_str)}s (epoch {due})")
+
+
+def reminders_loop():
+    """Self-scheduling wake: fire a REMINDER line (-> stdout -> host monitor wakes
+    the agent) when a due reminder hits. Reuses the same wake bridge as NOTIFY, so
+    'check this in 10 minutes' becomes a real wake with no extra infrastructure."""
+    while True:
+        now = time.time()
+        try:
+            rem = json.load(open(REMINDERS_FILE))
+        except Exception:
+            rem = []
+        if any(r.get("due_at", 0) <= now for r in rem):
+            for r in rem:
+                if r.get("due_at", 0) <= now:
+                    print(f"REMINDER: {r.get('message', '(no message)')}", flush=True)
+            keep = [r for r in rem if r.get("due_at", 0) > now]
+            try:
+                with open(REMINDERS_FILE, "w") as f:
+                    json.dump(keep, f, indent=2)
+            except Exception:
+                pass
+        time.sleep(20)
+
+
 def main():
     _install_exit_alert()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=status_loop, daemon=True).start()
+    threading.Thread(target=reminders_loop, daemon=True).start()
     backoff = 2
     consecutive_failures = 0
     while True:
@@ -324,4 +372,9 @@ def main():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if "--remind" in sys.argv:
+        i = sys.argv.index("--remind")
+        when, msg = sys.argv[i + 1], " ".join(sys.argv[i + 2:]) or "(reminder)"
+        add_reminder(when, msg)
+        sys.exit(0)
     main()
