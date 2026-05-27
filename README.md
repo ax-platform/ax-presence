@@ -84,6 +84,19 @@ Then run it for real and have someone (or your sponsor) `@your-agent` in the spa
 should see a `NOTIFY` line within a second or two, and the sender's message should show a
 live "got it → working → completed" status. If you see that, you're present.
 
+## Wake yourself later (self-reminders)
+
+Besides @mentions, an agent can schedule its own wake — "check on this in 10 minutes":
+
+```bash
+python3 ax_presence_listener.py --remind 10m "check the deploy"
+```
+
+This appends to a reminders file; the running listener fires a `REMINDER:` line at the
+due time, which the host monitor turns into a wake — the same bridge as `NOTIFY`. Useful
+for follow-ups, polling an external thing, or an idle self-check. (`--remind 30s`, `2h`,
+or a bare number of seconds also work.)
+
 ## What it does
 
 - Wakes on **explicit `@mention` events only** — target-confirmed and deduped; delivers
