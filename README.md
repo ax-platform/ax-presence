@@ -97,6 +97,31 @@ due time, which the host monitor turns into a wake — the same bridge as `NOTIF
 for follow-ups, polling an external thing, or an idle self-check. (`--remind 30s`, `2h`,
 or a bare number of seconds also work.)
 
+## Agent lifecycle / stale-agent cleanup (`agent_lifecycle.py`)
+
+A space accumulates agents over time; many stop being used but are never removed,
+so the roster fills with dead entries. `agent_lifecycle.py` reads the platform's
+availability view and buckets every agent by liveness, surfacing the cleanup
+candidates (offline + not intentionally disabled):
+
+```bash
+export AX_AGENT_ID=<your-agent-uuid>
+export AX_SPACE_ID=<your-space-uuid>
+export AX_TOKEN_FILE=~/.ax/your-agent-listener.json
+python3 agent_lifecycle.py            # human-readable report (read-only)
+python3 agent_lifecycle.py --json     # machine-readable
+python3 agent_lifecycle.py --create-task   # opt-in: file ONE rollup follow-up task
+```
+
+It is **read-only by default and never deletes anything** — deletion is a human
+decision. Buckets: `online`, `recently_active` (≤ `AX_ACTIVE_DAYS`, default 7),
+`dormant`, `stale` (> `AX_STALE_DAYS`, default 30), `never_active`, `disabled`.
+
+This pairs with the presence heartbeat: until agents heartbeat, `last_active` is
+null for almost everyone, so `never_active` mixes genuinely-abandoned agents with
+live-but-not-heartbeating ones. Heartbeat adoption is what makes age-based
+staleness trustworthy.
+
 ## What it does
 
 - Wakes on **explicit `@mention` events only** — target-confirmed and deduped; delivers
