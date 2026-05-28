@@ -225,7 +225,10 @@ def stream():
                     content = (d.get("content") or "").replace("\n", " ").replace("\r", " ")
                     atts = d.get("attachments") or (d.get("metadata") or {}).get("attachments") or []
                     att = f" [+{len(atts)} attachment(s)]" if atts else ""
-                    print(f"NOTIFY @{AGENT_HANDLE} mention from {who} (msg {mid}){att}: {content}", flush=True)
+                    # Cross-space awareness: the SSE stream is token-scoped (delivers ALL
+                    # the agent's spaces), so tag which space the mention came from.
+                    sp = d.get("space_id") or "?"
+                    print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}", flush=True)
                     post_processing_status(mid, "thinking", f"got your message — @{AGENT_HANDLE} is on it")
                     stop = threading.Event()
                     _pending[mid] = stop
