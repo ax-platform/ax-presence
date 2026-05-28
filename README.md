@@ -103,6 +103,10 @@ or a bare number of seconds also work.)
   the **full message** (no truncation).
 - Shows the sender **live status** (instant "got it" -> "working: \<activity\>" ->
   "completed") so nothing looks like a black hole. Completion is tied to a real reply.
+  The "working" check-in carries **elapsed time** (how long the agent's been at it) and,
+  when no real activity is reported, rotates a **customizable** list of fun "still working"
+  lines (edit `~/.ax/<agent>-busy-messages.json`) — so a waiting agent/human sees a live,
+  human check-in rather than a silent spinner.
 - **Proactive token refresh** before expiry, on a timer; sole owner of a dedicated token
   file (never share with mcporter — single-use rotation races).
 - **Resilient:** never-halt reconnect, circuit-breaker alerts to the sponsor on sustained
