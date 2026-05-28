@@ -35,6 +35,8 @@ TOKEN_FILE   = os.path.expanduser(
     os.environ.get("AX_TOKEN_FILE", f"~/.ax/{AGENT_HANDLE}-listener.json"))
 ACTIVITY_FILE = os.path.expanduser(
     os.environ.get("AX_ACTIVITY_FILE", f"~/.ax/{AGENT_HANDLE}-activity"))  # agent writes activity here
+REMINDERS_FILE = os.path.expanduser(
+    os.environ.get("AX_REMINDERS_FILE", f"~/.ax/{AGENT_HANDLE}-reminders.json"))  # self-scheduled wakes
 HEARTBEAT_FILE = os.path.expanduser(
     os.environ.get("AX_HEARTBEAT_FILE", f"~/.ax/{AGENT_HANDLE}-listener-heartbeat"))
 
@@ -223,7 +225,10 @@ def stream():
                     content = (d.get("content") or "").replace("\n", " ").replace("\r", " ")
                     atts = d.get("attachments") or (d.get("metadata") or {}).get("attachments") or []
                     att = f" [+{len(atts)} attachment(s)]" if atts else ""
-                    print(f"NOTIFY @{AGENT_HANDLE} mention from {who} (msg {mid}){att}: {content}", flush=True)
+                    # Cross-space awareness: the SSE stream is token-scoped (delivers ALL
+                    # the agent's spaces), so tag which space the mention came from.
+                    sp = d.get("space_id") or "?"
+                    print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}", flush=True)
                     post_processing_status(mid, "thinking", f"got your message — @{AGENT_HANDLE} is on it")
                     stop = threading.Event()
                     _pending[mid] = stop
@@ -289,11 +294,95 @@ def selftest():
     return 0
 
 
+def _parse_when(s):
+    """'10m' / '30s' / '2h' / '90' -> seconds (a bare number means seconds)."""
+    s = s.strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}.get(s[-1:], 1)
+    num = s[:-1] if s[-1:] in "smh" else s
+    return int(float(num) * mult)
+
+
+def add_reminder(when_str, message):
+    """Append a self-reminder; the running listener's reminders_loop fires it.
+    Lets an agent say 'wake me in 10m to check X' with one command."""
+    due = int(time.time()) + _parse_when(when_str)
+    try:
+        rem = json.load(open(REMINDERS_FILE))
+    except Exception:
+        rem = []
+    rem.append({"due_at": due, "message": message})
+    with open(REMINDERS_FILE, "w") as f:
+        json.dump(rem, f, indent=2)
+    print(f"reminder set: {message!r} fires in {_parse_when(when_str)}s (epoch {due})")
+
+
+def reminders_loop():
+    """Self-scheduling wake: fire a REMINDER line (-> stdout -> host monitor wakes
+    the agent) when a due reminder hits. Reuses the same wake bridge as NOTIFY, so
+    'check this in 10 minutes' becomes a real wake with no extra infrastructure."""
+    while True:
+        now = time.time()
+        try:
+            rem = json.load(open(REMINDERS_FILE))
+        except Exception:
+            rem = []
+        if any(r.get("due_at", 0) <= now for r in rem):
+            for r in rem:
+                if r.get("due_at", 0) <= now:
+                    print(f"REMINDER: {r.get('message', '(no message)')}", flush=True)
+            keep = [r for r in rem if r.get("due_at", 0) > now]
+            try:
+                with open(REMINDERS_FILE, "w") as f:
+                    json.dump(keep, f, indent=2)
+            except Exception:
+                pass
+        time.sleep(20)
+
+
+def home_digest():
+    """One-shot cross-space 'home' view: list the spaces this agent is in and show
+    recent activity. Agents live in many spaces; this is the central view. Note:
+    REST messages are space-context-scoped (only the current space reads cleanly),
+    so live cross-space activity flows through the listener's space-tagged NOTIFYs
+    on the token-scoped SSE stream. Returns a process exit code."""
+    at = current_access_token()
+    def _get(path):
+        req = urllib.request.Request(BASE + path, headers={"Authorization": "Bearer " + at})
+        return json.load(urllib.request.urlopen(req, timeout=20))
+    try:
+        sp = _get("/api/v1/spaces")
+    except Exception as e:
+        print(f"home: could not list spaces: {e!r}", flush=True)
+        return 1
+    spaces = sp if isinstance(sp, list) else sp.get("spaces", sp.get("items", []))
+    member = [s for s in spaces if isinstance(s, dict) and s.get("is_member")]
+    print(f"=== aX home — activity across your {len(member)} space(s) ===", flush=True)
+    for s in member:
+        sid_, name, cur = s.get("id"), s.get("name", "?"), (" (current)" if s.get("is_current") else "")
+        try:
+            data = _get("/api/v1/messages?" + urllib.parse.urlencode({"space_id": sid_, "limit": 8}))
+            msgs = data if isinstance(data, list) else data.get("messages", data.get("items", []))
+        except Exception:
+            msgs = []  # empty/non-JSON: REST is space-context-scoped -> no cross-space read
+        if not msgs:
+            print(f"  [{name}]{cur} member · live activity via SSE [space {sid_}]", flush=True)
+            continue
+        last = msgs[0]
+        who = last.get("display_name") or last.get("sender_name") or "?"
+        mine = sum(1 for m in msgs if mentions_me(m))
+        flag = f" · {mine} @-mention(s)" if mine else ""
+        print(f"  [{name}]{cur} {len(msgs)} recent · last: {who} {last.get('created_at','')[:19]}{flag}", flush=True)
+    print("(REST reads only the current space; cross-space live activity flows through the "
+          "listener's space-tagged NOTIFYs on the token-scoped SSE stream.)", flush=True)
+    return 0
+
+
 def main():
     _install_exit_alert()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=status_loop, daemon=True).start()
+    threading.Thread(target=reminders_loop, daemon=True).start()
     backoff = 2
     consecutive_failures = 0
     while True:
@@ -324,4 +413,11 @@ def main():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if "--home" in sys.argv:
+        sys.exit(home_digest())
+    if "--remind" in sys.argv:
+        i = sys.argv.index("--remind")
+        when, msg = sys.argv[i + 1], " ".join(sys.argv[i + 2:]) or "(reminder)"
+        add_reminder(when, msg)
+        sys.exit(0)
     main()
