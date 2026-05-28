@@ -27,7 +27,7 @@ class Event:
     summary: str                    # one line; becomes the NOTIFY text
     payload: dict = field(default_factory=dict)   # source-specific detail (ids, urls, content)
     dedup_key: str = ""             # stable id; CORE skips repeats (a mention arrives twice)
-    target: Optional[str] = None    # if set, CORE wakes ONLY when it matches this agent
+    target: Optional[str] = None    # two modes — see "Target-match" below
 
 class Source(Protocol):
     name: str
@@ -59,6 +59,22 @@ def _pump(src, seen, wake):
 the actual wake (Claude Code Monitor = stdout→session; daemon = spawn-per-line; tmux =
 inject). Keeping `wake → stdout` as the seam means nothing host-specific leaks into a
 source. (protocol's host-agnostic point.)
+
+## Target-match: two modes (per protocol)
+
+`target` unifies how different sources decide "is this for me?" — the core rule is
+`wake if event.target is None or event.target == me`:
+
+- **event-declares-target** (aX mention): the source PARSES `target` from the event
+  (who got @'d). The stream is broadcast, so the core wakes only when it's me.
+- **source-configured-target** (MCP-health, GitHub-PR): the event has no inherent
+  target; the Source was *configured* to watch on this subscriber's behalf, so it
+  leaves `target = None` → the core always wakes. (If one source instance ever served
+  multiple subscribers, it would set `target` to the subscriber.)
+
+Implemented as `matches_target()` in `monitor_core.py` — verified with a mixed self-demo
+(health events always wake; a mention for `me` wakes, one for `someone-else` doesn't, a
+repeated `dedup_key` is dropped).
 
 ## Adapters (one per source, all behind the same seam)
 
