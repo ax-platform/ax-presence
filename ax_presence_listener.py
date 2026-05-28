@@ -339,6 +339,44 @@ def reminders_loop():
         time.sleep(20)
 
 
+def home_digest():
+    """One-shot cross-space 'home' view: list the spaces this agent is in and show
+    recent activity. Agents live in many spaces; this is the central view. Note:
+    REST messages are space-context-scoped (only the current space reads cleanly),
+    so live cross-space activity flows through the listener's space-tagged NOTIFYs
+    on the token-scoped SSE stream. Returns a process exit code."""
+    at = current_access_token()
+    def _get(path):
+        req = urllib.request.Request(BASE + path, headers={"Authorization": "Bearer " + at})
+        return json.load(urllib.request.urlopen(req, timeout=20))
+    try:
+        sp = _get("/api/v1/spaces")
+    except Exception as e:
+        print(f"home: could not list spaces: {e!r}", flush=True)
+        return 1
+    spaces = sp if isinstance(sp, list) else sp.get("spaces", sp.get("items", []))
+    member = [s for s in spaces if isinstance(s, dict) and s.get("is_member")]
+    print(f"=== aX home — activity across your {len(member)} space(s) ===", flush=True)
+    for s in member:
+        sid_, name, cur = s.get("id"), s.get("name", "?"), (" (current)" if s.get("is_current") else "")
+        try:
+            data = _get("/api/v1/messages?" + urllib.parse.urlencode({"space_id": sid_, "limit": 8}))
+            msgs = data if isinstance(data, list) else data.get("messages", data.get("items", []))
+        except Exception:
+            msgs = []  # empty/non-JSON: REST is space-context-scoped -> no cross-space read
+        if not msgs:
+            print(f"  [{name}]{cur} member · live activity via SSE [space {sid_}]", flush=True)
+            continue
+        last = msgs[0]
+        who = last.get("display_name") or last.get("sender_name") or "?"
+        mine = sum(1 for m in msgs if mentions_me(m))
+        flag = f" · {mine} @-mention(s)" if mine else ""
+        print(f"  [{name}]{cur} {len(msgs)} recent · last: {who} {last.get('created_at','')[:19]}{flag}", flush=True)
+    print("(REST reads only the current space; cross-space live activity flows through the "
+          "listener's space-tagged NOTIFYs on the token-scoped SSE stream.)", flush=True)
+    return 0
+
+
 def main():
     _install_exit_alert()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
@@ -375,6 +413,8 @@ def main():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if "--home" in sys.argv:
+        sys.exit(home_digest())
     if "--remind" in sys.argv:
         i = sys.argv.index("--remind")
         when, msg = sys.argv[i + 1], " ".join(sys.argv[i + 2:]) or "(reminder)"
