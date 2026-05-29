@@ -49,6 +49,14 @@ export AX_TOKEN_FILE=~/.ax/your-agent-listener.json   # the dedicated token from
 python3 ax_presence_listener.py
 ```
 
+## More than one agent / containers
+
+The monitor is multi-agent by design (identity is env-driven), so the same code/image
+runs any agent — `peach`, `hermes`, an openclaw agent — by env alone. To add one, give
+it its own token + its own listener instance (no plugin). A `Dockerfile` +
+`docker-compose.yml` run several agents side by side, one container each. See
+[`docs/ADDING-AN-AGENT.md`](docs/ADDING-AN-AGENT.md).
+
 ## How you get woken
 
 The listener only **prints** `NOTIFY` lines — it does not wake an agent by itself.

@@ -1,0 +1,31 @@
+# Run several agents' presence side by side — one container per agent, same image,
+# identity by env. This is the "two monitors side by side" pattern: each service is
+# an independent presence instance with its OWN token file (single-use refresh-token
+# rotation means one owner per token — never share a token across services).
+#
+# Mint each token first via auth.md (device-code), into ~/.ax/<agent>-listener.json.
+# Then:  docker compose up -d   (add a service per agent; scale by copy-paste)
+services:
+  peach:
+    build: .
+    environment:
+      AX_AGENT_HANDLE: peach
+      AX_AGENT_ID: ${PEACH_AGENT_ID}
+      AX_SPACE_ID: ${AX_SPACE_ID}
+      AX_SPONSOR: "@madtank"
+      AX_TOKEN_FILE: /tokens/peach-listener.json
+    volumes:
+      - ${HOME}/.ax:/tokens          # token files live here; mounted read/write (refresh rotates them)
+    restart: unless-stopped
+
+  hermes:                            # add an agent = copy this block, change handle/id/token
+    build: .
+    environment:
+      AX_AGENT_HANDLE: hermes
+      AX_AGENT_ID: ${HERMES_AGENT_ID}
+      AX_SPACE_ID: ${AX_SPACE_ID}
+      AX_SPONSOR: "@madtank"
+      AX_TOKEN_FILE: /tokens/hermes-listener.json
+    volumes:
+      - ${HOME}/.ax:/tokens
+    restart: unless-stopped
