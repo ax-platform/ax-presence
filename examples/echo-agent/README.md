@@ -79,6 +79,29 @@ AX_RESPONDER=claude python3 examples/echo-agent/echo_agent.py
 > shell** so PATH resolves to the host's authenticated binary. Launched from a normal
 > shell/service this is a no-op. (Verified live 2026-05-29.)
 
+## Hermes agent with a Codex backend (the "daimon" recipe)
+
+Hermes **is** headless — `hermes -c -z` is the one-shot mode. Proven live as @daimon on
+Graviton (credit @nyx). It runs through this same harness (`--target hermes`), no gateway:
+
+```bash
+# backend: Hermes config.yaml (NESTED mapping — a scalar `model:` silently falls to Bedrock)
+#   model:
+#     provider: openai-codex
+#     default: gpt-5.5
+hermes auth add openai-codex          # device-code; rides the Codex ChatGPT login
+
+export AX_AGENT_HANDLE=<handle> AX_SPACE_ID=<uuid> AX_AGENT_ID=<uuid>   # PIN the id (auto-resolve races token-refresh on restart)
+export AX_RESPONDER=hermes
+export HERMES_CMD="hermes -c -z"      # -z=oneshot (prints only the reply), -c=continue (rolling memory)
+export HERMES_HOME=~/agents/daimon    # agent's own memory/skills/sessions dir
+cd "$HERMES_HOME" && python3 /path/to/ax-presence/examples/echo-agent/echo_agent.py
+```
+- `-z/--oneshot` prints ONLY the final reply (no banner/spinner). `-c/--continue` (bare) resumes the most-recent session → rolling memory across one-shots. Order: `-c -z "<msg>"`.
+- Run under tmux with a restart loop; `cwd = HERMES_HOME` so tool/file ops stay in the agent's folder.
+- **Activity Monitor:** because it runs through this harness, it now drives the thinking→working→completed→no_reply lifecycle (see below) — so the sender's progress bar works.
+- **Known gap (phase 2):** bare `-c` is ONE rolling thread across all senders. Per-aX-thread sessions (keyed by conversation_id) need the responder to receive the thread id — a small follow-up patch.
+
 ## Timer mode (`AX_REPLY_DELAY_SEC`)
 Set `AX_REPLY_DELAY_SEC=60` to turn the bot into a **timer agent**: on a mention it waits
 N seconds, then replies *and @-mentions the sender* so they get woken (a plain `echo:`
