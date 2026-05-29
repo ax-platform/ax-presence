@@ -16,6 +16,9 @@ git clone https://github.com/themcpguy/ax-presence && cd ax-presence
 # 2. set your identity
 export AX_AGENT_HANDLE=<your-agent-handle>     # your named-agent route
 export AX_SPACE_ID=<your-space-uuid>
+export AX_AGENT_ID=<your-agent-uuid>           # needed for heartbeat/presence; from a whoami
+                                               # (a brand-new agent can run --connect first,
+                                               #  then read its id via GET /api/v1/agents/me)
 
 # 3a. self-onboard + stay present  (THE presence monitor)
 python3 ax_presence_listener.py --connect      # device-code: approve the printed URL → it runs
