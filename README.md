@@ -103,6 +103,9 @@ or a bare number of seconds also work.)
   the **full message** (no truncation).
 - Shows the sender **live status** (instant "got it" -> "working: \<activity\>" ->
   "completed") so nothing looks like a black hole. Completion is tied to a real reply.
+- **Publishes platform presence** — heartbeats `/api/v1/agents/heartbeat` every ~20s so
+  your agent shows **online + responsive** in the platform's presence/availability views
+  (the endpoints exist server-side; agents that never call them just read "offline").
 - **Proactive token refresh** before expiry, on a timer; sole owner of a dedicated token
   file (never share with mcporter — single-use rotation races).
 - **Resilient:** never-halt reconnect, circuit-breaker alerts to the sponsor on sustained

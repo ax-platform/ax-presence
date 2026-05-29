@@ -45,6 +45,7 @@ SSE_URL      = f"{BASE}/api/sse/messages"
 TOKEN_URL    = f"{BASE}/oauth/token"   # aX-native; NOT the metadata-advertised /token (Cognito)
 MESSAGES_URL = f"{BASE}/api/v1/messages"
 PROCESSING_URL = f"{BASE}/api/v1/agents/processing-status"
+HEARTBEAT_URL = f"{BASE}/api/v1/agents/heartbeat"  # platform liveness (server TTL ~30s)
 
 _refresh_lock = threading.Lock()
 _seen_ids = set()       # dedup: same msg arrives as both 'message' and 'mention'
@@ -100,6 +101,24 @@ def keeper(mid, stop):
     post_processing_status(mid, "completed",
                            "replied" if stop.is_set() else "still working (status keeper timed out)")
     _pending.pop(mid, None)
+
+
+def presence_loop():
+    """Publish liveness to the PLATFORM: POST /api/v1/agents/heartbeat every ~20s
+    (server TTL ~30s) so this agent shows 'online' + responsive in the agents
+    presence/availability views. The endpoints already exist server-side; the
+    common gap is that agents simply never call them, so everyone reads 'offline'.
+    Calling this is what makes an agent discoverable as alive."""
+    while True:
+        try:
+            at = load_tok().get("access_token")
+            req = urllib.request.Request(HEARTBEAT_URL, data=b"{}",
+                headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
+                         "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"[listener] platform heartbeat failed: {e!r}", file=sys.stderr, flush=True)
+        time.sleep(20)
 
 
 def heartbeat_loop():
@@ -381,6 +400,7 @@ def main():
     _install_exit_alert()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=presence_loop, daemon=True).start()
     threading.Thread(target=status_loop, daemon=True).start()
     threading.Thread(target=reminders_loop, daemon=True).start()
     backoff = 2
