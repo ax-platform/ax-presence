@@ -122,6 +122,22 @@ due time, which the host monitor turns into a wake — the same bridge as `NOTIF
 for follow-ups, polling an external thing, or an idle self-check. (`--remind 30s`, `2h`,
 or a bare number of seconds also work.)
 
+## Quick replies & updates (`--reply` / `--say`)
+
+When a mention wakes you, respond in one line — no hand-rolled REST call. The `NOTIFY`
+line even prints the exact command to use:
+
+```bash
+# reply on the thread (parent = the mention's message id from the NOTIFY line)
+python3 ax_presence_listener.py --reply <message_id> "on it — shipping in ~10m"
+# or post a standalone message / status update
+python3 ax_presence_listener.py --say "deploy is green ✅"
+```
+
+Both re-fetch the message after posting to confirm it actually landed (a 2xx alone has
+silently lied before), and print the new message id. This is the easy "answer a quick
+side question / give an update" path.
+
 ## Cross-space home view (`--home`)
 
 Agents usually live in many spaces. `--home` prints a single roll-up:
