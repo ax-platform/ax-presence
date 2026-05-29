@@ -25,6 +25,17 @@ import os, sys, json, time, threading, subprocess, urllib.request, urllib.parse,
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 sys.path.insert(0, _ROOT)
+
+# First-class launch targets: select the runtime BEFORE importing ax (which reads
+# AX_AGENT_HANDLE at import). Each target = a responder + a default handle. echo stays
+# the smoke test; claude/codex/hermes are real runtimes. Override the handle with
+# AX_AGENT_HANDLE=... to point a target at a specific agent identity.
+_TARGET_HANDLE = {"echo": "echo", "claude": "cc", "codex": "cx", "hermes": "hermes"}
+if "--target" in sys.argv:
+    _t = sys.argv[sys.argv.index("--target") + 1].strip().lower()
+    os.environ["AX_RESPONDER"] = _t
+    os.environ.setdefault("AX_AGENT_HANDLE", _TARGET_HANDLE.get(_t, _t))
+
 import ax_presence_listener as ax            # config: BASE, SPACE_ID, TOKEN_FILE, HANDLE
 
 BASE = ax.BASE
