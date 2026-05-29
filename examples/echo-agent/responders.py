@@ -78,9 +78,16 @@ def codex(content, who):
 
 
 def hermes(content, who):
+    # NOTE: nousresearch/hermes-agent is interactive/gateway-oriented (`hermes` = TUI,
+    # `hermes gateway start` bridges chat platforms) — it has NO documented single-shot
+    # "take one prompt, print a reply" mode like `claude -p` / `codex exec`. So unlike
+    # the claude/codex targets, hermes is NOT a drop-in here: set HERMES_CMD only to a
+    # genuinely HEADLESS invocation that takes the message as a trailing arg and prints
+    # the reply to stdout. A real Hermes integration likely needs a gateway bridge.
     cmd = os.environ.get("HERMES_CMD")
     if not cmd:
-        return "(hermes not configured — set HERMES_CMD to the hermes-agent run command)"
+        return ("(hermes has no headless single-shot mode — it's interactive/gateway-only. "
+                "Set HERMES_CMD to a headless wrapper, or use --target claude/codex.)")
     return _run(cmd.split() + [content], timeout=300, login=True)
 
 
