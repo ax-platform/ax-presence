@@ -44,6 +44,18 @@ HEARTBEAT_FILE = os.path.expanduser(
     os.environ.get("AX_HEARTBEAT_FILE", f"~/.ax/{AGENT_HANDLE}-listener-heartbeat"))
 HOME_FEED_FILE = os.path.expanduser(
     os.environ.get("AX_HOME_FEED_FILE", f"~/.ax/{AGENT_HANDLE}-home-feed.json"))  # rolling cross-space SSE activity
+BUSY_MESSAGES_FILE = os.path.expanduser(
+    os.environ.get("AX_BUSY_MESSAGES_FILE", f"~/.ax/{AGENT_HANDLE}-busy-messages.json"))  # customizable check-in lines
+# Fun, customizable "still working" check-in lines the waiting party sees while this
+# agent works. Edit BUSY_MESSAGES_FILE (a JSON list) to personalize; these are defaults.
+DEFAULT_BUSY = [
+    "still on it — hang tight 🛠️",
+    "deep in this one, give me a sec",
+    "grinding through it ⚙️",
+    "🖕 busy busy — almost there 😅",
+    "thinking hard, don't go anywhere",
+    "cooking… 🍳",
+]
 
 BASE         = os.environ.get("AX_BASE", "https://paxai.app")
 SSE_URL      = f"{BASE}/api/sse/messages"
@@ -92,22 +104,53 @@ def post_processing_status(mid, status, activity=None):
         print(f"[listener] processing-status post failed: {e!r}", file=sys.stderr, flush=True)
 
 
+def _fmt_elapsed(secs):
+    """Human 'how long': 45s, 2m10s, 1h03m."""
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def load_busy_messages():
+    """Customizable 'still working' check-in lines (JSON list at BUSY_MESSAGES_FILE);
+    falls back to DEFAULT_BUSY. Re-read per message so edits take effect live."""
+    try:
+        msgs = json.load(open(BUSY_MESSAGES_FILE))
+        if isinstance(msgs, list) and msgs:
+            return [str(m) for m in msgs]
+    except Exception:
+        pass
+    return DEFAULT_BUSY
+
+
 def keeper(mid, stop):
-    """Keep the sender's progress bar ALIVE while this agent works on `mid`:
-    re-post 'working' every ~25s with the current activity (dynamic — the agent
-    writes ACTIVITY_FILE to update what it's doing, never generic), until the
-    reply lands (stop set, by the stream loop) or a safety cap. Then 'completed'.
-    A response is what closes the message."""
-    deadline = time.time() + 900  # 15 min safety cap
+    """Keep the requester's check-in / progress bar ALIVE while this agent works on
+    `mid`: re-post 'working' every ~25s until the reply lands (stop set, by the stream
+    loop) or a safety cap, then 'completed'. The status carries (a) HOW LONG the agent
+    has been working (elapsed), and (b) either the real activity (agent writes
+    ACTIVITY_FILE) or a rotating fun, customizable 'still working' line. This is the
+    agent-to-agent check-in: the waiting party sees a live spinner + 'still on it',
+    not a black hole. A response is what closes the message."""
+    start = time.time()
+    deadline = start + 900  # 15 min safety cap
+    busy = load_busy_messages()
+    i = 0
     while not stop.is_set() and time.time() < deadline:
         try:
-            act = open(ACTIVITY_FILE).read().strip() or f"@{AGENT_HANDLE} is working on it"
+            act = open(ACTIVITY_FILE).read().strip()
         except Exception:
-            act = f"@{AGENT_HANDLE} is working on it"
-        post_processing_status(mid, "working", act)
+            act = ""
+        if not act:                       # no real activity reported -> rotate a fun check-in
+            act = busy[i % len(busy)]
+            i += 1
+        post_processing_status(mid, "working", f"{act} (⏱ {_fmt_elapsed(time.time() - start)})")
         stop.wait(25)
+    total = _fmt_elapsed(time.time() - start)
     post_processing_status(mid, "completed",
-                           "replied" if stop.is_set() else "still working (status keeper timed out)")
+                           f"replied (took {total})" if stop.is_set() else f"still working (keeper timed out after {total})")
     _pending.pop(mid, None)
 
 

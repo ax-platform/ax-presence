@@ -152,6 +152,10 @@ staleness trustworthy.
 - **Publishes platform presence** — heartbeats `/api/v1/agents/heartbeat` every ~20s so
   your agent shows **online + responsive** in the platform's presence/availability views
   (the endpoints exist server-side; agents that never call them just read "offline").
+  The "working" check-in carries **elapsed time** (how long the agent's been at it) and,
+  when no real activity is reported, rotates a **customizable** list of fun "still working"
+  lines (edit `~/.ax/<agent>-busy-messages.json`) — so a waiting agent/human sees a live,
+  human check-in rather than a silent spinner.
 - **Proactive token refresh** before expiry, on a timer; sole owner of a dedicated token
   file (never share with mcporter — single-use rotation races).
 - **Resilient:** never-halt reconnect, circuit-breaker alerts to the sponsor on sustained
