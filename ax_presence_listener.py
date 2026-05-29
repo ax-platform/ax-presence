@@ -39,6 +39,8 @@ REMINDERS_FILE = os.path.expanduser(
     os.environ.get("AX_REMINDERS_FILE", f"~/.ax/{AGENT_HANDLE}-reminders.json"))  # self-scheduled wakes
 HEARTBEAT_FILE = os.path.expanduser(
     os.environ.get("AX_HEARTBEAT_FILE", f"~/.ax/{AGENT_HANDLE}-listener-heartbeat"))
+HOME_FEED_FILE = os.path.expanduser(
+    os.environ.get("AX_HOME_FEED_FILE", f"~/.ax/{AGENT_HANDLE}-home-feed.json"))  # rolling cross-space SSE activity
 
 BASE         = os.environ.get("AX_BASE", "https://paxai.app")
 SSE_URL      = f"{BASE}/api/sse/messages"
@@ -53,6 +55,9 @@ _alerted_exit = False   # exit alert fires at most once
 _connected = False
 _mentions_seen = 0
 _pending = {}           # message_id -> threading.Event, set when this agent's reply lands
+HOME_FEED_MAX = 200     # cap the rolling cross-space feed buffer so the file stays small
+_home_feed = []         # in-memory rolling list of recent cross-space events (newest last)
+_home_lock = threading.Lock()
 
 
 def alert(text):
@@ -207,6 +212,34 @@ def mentions_me(d):
     return False
 
 
+def record_home_event(d, event):
+    """Accumulate every space-tagged SSE event into a rolling cross-space feed.
+    The SSE stream is token-scoped (delivers ALL the agent's spaces), so this is
+    the only live source of cross-space activity — REST messages reads only the
+    current space. Persisted to HOME_FEED_FILE so the one-shot `--home` view
+    (a separate process) renders real recent activity, not just a snapshot."""
+    rec = {
+        "ts": d.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "space_id": d.get("space_id") or "?",
+        "who": d.get("username") or d.get("display_name") or d.get("agent_name") or d.get("sender_name") or "?",
+        "kind": event,
+        "mine": d.get("agent_id") == AGENT_ID,
+        "text": (d.get("content") or "").replace("\n", " ").replace("\r", " ")[:140],
+    }
+    with _home_lock:
+        _home_feed.append(rec)
+        if len(_home_feed) > HOME_FEED_MAX:
+            del _home_feed[:len(_home_feed) - HOME_FEED_MAX]
+        snapshot = list(_home_feed)
+    try:
+        tmp = HOME_FEED_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, HOME_FEED_FILE)  # atomic so --home never reads a half-write
+    except Exception:
+        pass
+
+
 def stream():
     req = urllib.request.Request(SSE_URL, headers={
         "Authorization": "Bearer " + current_access_token(),
@@ -228,6 +261,11 @@ def stream():
                     d = json.loads(line[5:].strip())
                 except Exception:
                     continue
+                # Rolling cross-space feed: record on the 'message' firehose (the
+                # superset; 'mention' is a subset) so each message lands once,
+                # including this agent's own posts (full activity view).
+                if event == "message":
+                    record_home_event(d, event)
                 if d.get("agent_id") == AGENT_ID:
                     par = d.get("parent_id")
                     if par in _pending:
@@ -391,8 +429,24 @@ def home_digest():
         mine = sum(1 for m in msgs if mentions_me(m))
         flag = f" · {mine} @-mention(s)" if mine else ""
         print(f"  [{name}]{cur} {len(msgs)} recent · last: {who} {last.get('created_at','')[:19]}{flag}", flush=True)
-    print("(REST reads only the current space; cross-space live activity flows through the "
-          "listener's space-tagged NOTIFYs on the token-scoped SSE stream.)", flush=True)
+    # Live cross-space feed: what the running listener actually observed on the
+    # token-scoped SSE stream (the only real cross-space source — REST is space-scoped).
+    try:
+        feed = json.load(open(HOME_FEED_FILE))
+    except Exception:
+        feed = []
+    if feed:
+        names = {s.get("id"): s.get("name", "?") for s in member if isinstance(s, dict)}
+        print(f"\n=== live cross-space feed — last {min(len(feed), 12)} of {len(feed)} events seen by the listener ===", flush=True)
+        for rec in feed[-12:]:
+            sp = names.get(rec.get("space_id"), (rec.get("space_id") or "?")[:8])
+            who = (AGENT_HANDLE if rec.get("mine") else rec.get("who", "?"))
+            print(f"  [{rec.get('ts','')[:19]}] ({sp}) {who}: {rec.get('text','')}", flush=True)
+    else:
+        print(f"\n(no live feed yet — the listener populates {HOME_FEED_FILE} as space-tagged "
+              "SSE events arrive; run the listener to accumulate cross-space activity.)", flush=True)
+    print("\n(REST reads only the current space; the live feed above is the listener's "
+          "token-scoped SSE stream, the real cross-space activity source.)", flush=True)
     return 0
 
 

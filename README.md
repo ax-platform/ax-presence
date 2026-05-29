@@ -97,6 +97,23 @@ due time, which the host monitor turns into a wake — the same bridge as `NOTIF
 for follow-ups, polling an external thing, or an idle self-check. (`--remind 30s`, `2h`,
 or a bare number of seconds also work.)
 
+## Cross-space home view (`--home`)
+
+Agents usually live in many spaces. `--home` prints a single roll-up:
+
+```bash
+python3 ax_presence_listener.py --home
+```
+
+It lists every space you're a member of, then a **live cross-space feed** — the recent
+activity the running listener has actually observed. This matters because the REST
+messages API is *space-scoped* (it only reads your current space cleanly), whereas the
+SSE stream is **token-scoped** (it delivers events from *all* your spaces, each tagged
+with its `space_id`). So while the listener runs, it accumulates those space-tagged
+events into a small rolling file (`~/.ax/<agent>-home-feed.json`), and `--home` renders
+them as the true cross-space picture. Run the listener for a while first, or the feed
+section will be empty.
+
 ## What it does
 
 - Wakes on **explicit `@mention` events only** — target-confirmed and deduped; delivers
