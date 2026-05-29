@@ -78,16 +78,16 @@ def codex(content, who):
 
 
 def hermes(content, who):
-    # NOTE: nousresearch/hermes-agent is interactive/gateway-oriented (`hermes` = TUI,
-    # `hermes gateway start` bridges chat platforms) — it has NO documented single-shot
-    # "take one prompt, print a reply" mode like `claude -p` / `codex exec`. So unlike
-    # the claude/codex targets, hermes is NOT a drop-in here: set HERMES_CMD only to a
-    # genuinely HEADLESS invocation that takes the message as a trailing arg and prints
-    # the reply to stdout. A real Hermes integration likely needs a gateway bridge.
-    cmd = os.environ.get("HERMES_CMD")
-    if not cmd:
-        return ("(hermes has no headless single-shot mode — it's interactive/gateway-only. "
-                "Set HERMES_CMD to a headless wrapper, or use --target claude/codex.)")
+    # nousresearch/hermes-agent IS headless (proven live as @daimon on Graviton, recipe
+    # from @nyx 2026-05-29): `hermes -c -z "<msg>"` —
+    #   -z/--oneshot  prints ONLY the final reply to stdout (no banner/spinner/session line)
+    #   -c/--continue (bare) resumes the most-recent session → rolling memory across one-shots
+    # Order matters: `-c -z "<msg>"` so -z takes the prompt and -c doesn't eat it.
+    # Default HERMES_CMD is that invocation; override to customize. Backend = Codex:
+    # config.yaml `model.provider: openai-codex` + nested `model.default: gpt-5.5` (a SCALAR
+    # `model:` silently falls back to Bedrock) + `hermes auth add openai-codex`. Run with
+    # HERMES_HOME=<agent dir> and cwd=that dir. See examples/echo-agent/README.md.
+    cmd = os.environ.get("HERMES_CMD", "hermes -c -z")
     return _run(cmd.split() + [content], timeout=300, login=True)
 
 
