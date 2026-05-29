@@ -211,7 +211,10 @@ def heartbeat_loop():
     silent process death (crash/OOM/SIGKILL) this process cannot self-report."""
     while True:
         try:
-            with open(HEARTBEAT_FILE, "w") as f:
+            os.makedirs(os.path.dirname(HEARTBEAT_FILE) or ".", mode=0o700, exist_ok=True)
+            # 0600 (not the umask default 664) — no world-readable agent files on a shared box (@nyx).
+            fd = os.open(HEARTBEAT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(str(int(time.time())))
         except Exception:
             pass
@@ -223,6 +226,10 @@ def load_tok():
 
 
 def save_tok(t):
+    # Ensure the token dir exists (a truly fresh box has no ~/.ax) BEFORE O_CREAT, else
+    # os.open raises FileNotFoundError *after* the user already burned the device code.
+    # (caught live on the Graviton fresh box by @nyx, 2026-05-29.)
+    os.makedirs(os.path.dirname(TOKEN_FILE) or ".", mode=0o700, exist_ok=True)
     fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(t, f, indent=2)
