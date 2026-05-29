@@ -60,6 +60,10 @@ DEFAULT_BUSY = [
 BASE         = os.environ.get("AX_BASE", "https://paxai.app")
 SSE_URL      = f"{BASE}/api/sse/messages"
 TOKEN_URL    = f"{BASE}/oauth/token"   # aX-native; NOT the metadata-advertised /token (Cognito)
+REGISTER_URL = f"{BASE}/oauth/register"          # device-code self-onboarding (--connect)
+DEVICE_URL   = f"{BASE}/oauth/device/code"
+RESOURCE     = f"{BASE}/mcp/agents/{AGENT_HANDLE}"  # named-agent route REQUIRED (base /mcp -> invalid_target)
+SCOPE        = "openid offline_access ax-api/mcp:read ax-api/mcp:write"
 MESSAGES_URL = f"{BASE}/api/v1/messages"
 PROCESSING_URL = f"{BASE}/api/v1/agents/processing-status"
 HEARTBEAT_URL = f"{BASE}/api/v1/agents/heartbeat"  # platform liveness (server TTL ~30s)
@@ -192,6 +196,85 @@ def save_tok(t):
     fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(t, f, indent=2)
+
+
+def _form_post(url, fields):
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:        # device-code errors come back as 400 JSON
+        try:
+            return json.load(e)
+        except Exception:
+            return {"error": f"http_{e.code}"}
+
+
+def connect():
+    """Self-onboarding via device-code OAuth: the agent creates a verification URL,
+    hands it to the human, and WAITS (polls) until they approve — then writes its own
+    token file and returns. This IS the 'device-code wait' as a startup step, so a
+    brand-new agent goes from nothing -> connected with one command (`--connect`),
+    then proceeds to stay present. Uses the aX-native /oauth/* endpoints (NOT the
+    Cognito /.well-known metadata). No deps beyond stdlib."""
+    if AGENT_HANDLE in ("", "your-agent"):
+        print("connect: set AX_AGENT_HANDLE first (it picks your named-agent route).", flush=True)
+        return 1
+    print(f"[connect] registering a public client for @{AGENT_HANDLE}…", flush=True)
+    req = urllib.request.Request(REGISTER_URL,
+        data=json.dumps({
+            "client_name": f"{AGENT_HANDLE} listener",
+            "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+            "token_endpoint_auth_method": "none", "redirect_uris": [], "scope": SCOPE,
+        }).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            client_id = json.load(r).get("client_id")
+    except Exception as e:
+        print(f"[connect] register failed: {e!r}", flush=True)
+        return 1
+    if not client_id:
+        print("[connect] register returned no client_id", flush=True)
+        return 1
+
+    dc = _form_post(DEVICE_URL, {"client_id": client_id, "resource": RESOURCE, "scope": SCOPE})
+    if not dc.get("device_code"):
+        print(f"[connect] device/code failed: {dc}", flush=True)
+        return 1
+    interval = int(dc.get("interval", 5))
+    print("\n  >>> APPROVE HERE: " + str(dc.get("verification_uri_complete")), flush=True)
+    print("  >>> user_code:   " + str(dc.get("user_code")) + "\n", flush=True)
+    print(f"[connect] waiting for approval (polling every {interval}s)…", flush=True)
+
+    deadline = time.time() + int(dc.get("expires_in", 600))
+    while time.time() < deadline:
+        time.sleep(interval)
+        resp = _form_post(TOKEN_URL, {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": dc["device_code"], "client_id": client_id,
+        })
+        err = resp.get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err:
+            print(f"[connect] token error: {err}", flush=True)
+            return 1
+        now = int(time.time())                  # success — no error field
+        save_tok({
+            "access_token": resp["access_token"], "refresh_token": resp.get("refresh_token"),
+            "client_id": client_id, "token_type": resp.get("token_type", "Bearer"),
+            "scope": resp.get("scope", SCOPE), "expires_in": resp.get("expires_in"),
+            "expires_at": now + int(resp.get("expires_in", 900)), "obtained_at": now,
+        })
+        print(f"[connect] connected — token written to {TOKEN_FILE}", flush=True)
+        return 0
+    print("[connect] device code expired before approval — re-run --connect.", flush=True)
+    return 1
 
 
 def refresh():
@@ -568,6 +651,12 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--connect" in sys.argv:
+        # Self-onboard, then (unless --connect-only) fall through to stay present, so
+        # a brand-new agent goes nothing -> connected -> present in one command.
+        rc = connect()
+        if rc != 0 or "--connect-only" in sys.argv:
+            sys.exit(rc)
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     if "--home" in sys.argv:
