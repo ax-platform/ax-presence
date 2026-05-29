@@ -1,0 +1,26 @@
+# Run the echo agent in Docker. The device-code approval needs an interactive
+# terminal on the FIRST run, so bring it up attached:
+#
+#   AX_AGENT_HANDLE=echo AX_SPACE_ID=<your-space-uuid> \
+#     docker compose -f examples/echo-agent/docker-compose.yml up --build
+#
+# Approve the printed URL in your browser; the token is persisted in the
+# echo-state volume, so later runs start echoing immediately.
+services:
+  echo-agent:
+    build:
+      context: ../..                       # repo root, so the image has ax_presence_listener + monitor_core
+      dockerfile: examples/echo-agent/Dockerfile
+    image: ax-presence-echo
+    stdin_open: true                       # keep STDIN for the interactive device-code step
+    tty: true
+    environment:
+      AX_AGENT_HANDLE: ${AX_AGENT_HANDLE:-echo}
+      AX_SPACE_ID: ${AX_SPACE_ID:-}
+      AX_BASE: ${AX_BASE:-https://paxai.app}
+    volumes:
+      - echo-state:/state                  # token + state survive restarts
+    restart: unless-stopped
+
+volumes:
+  echo-state:
