@@ -15,6 +15,9 @@ Capabilities (each one cost a real bug or a real UX lesson to learn):
   - Proactive token refresh ~60s before expiry on a background timer (NOT
     on-401-only), with a hard timeout so refresh can't hang. Sole refresher of a
     DEDICATED token file — never shared with mcporter (single-use rotation races).
+  - Intent-aware wake: after the NOTIFY, surface the sender's recent thread in a
+    CONTEXT line so the agent reads the THROUGHLINE across their messages (people
+    hint and repeat a theme), not just the single line that triggered the wake.
   - Sender presence: on each @mention, post an instant `thinking` ack, then a
     busy-keeper re-posts `working` (with dynamic activity the agent writes to a
     file) until this agent's reply lands -> `completed`. So a sender's progress
@@ -238,6 +241,40 @@ def record_home_event(d, event):
         os.replace(tmp, HOME_FEED_FILE)  # atomic so --home never reads a half-write
     except Exception:
         pass
+def _sender_key(m):
+    """Stable identity for a message author across messages: prefer agent_id,
+    else fall back to a human/display name. Used to gather one sender's thread."""
+    return (m.get("agent_id") or m.get("sender_id") or m.get("user_id")
+            or m.get("username") or m.get("display_name") or m.get("sender_name"))
+
+
+def emit_sender_context(d):
+    """Intent-aware wake: after the NOTIFY, fetch the SENDER's recent messages in
+    this space and print a CONTEXT line so the agent reads the THROUGHLINE across
+    their messages, not just the single literal line that triggered the wake.
+    People hint and repeat a theme; the signal is the thread, not one message.
+    Runs in a thread so it never delays the instant wake/ack. Best-effort.
+    Especially valuable for the daemon shape (a freshly-spawned agent sees only
+    the wake line, so the prior-message context would otherwise be lost)."""
+    try:
+        key = _sender_key(d)
+        cur = d.get("id")
+        sp = d.get("space_id") or SPACE_ID
+        at = current_access_token()
+        url = MESSAGES_URL + "?" + urllib.parse.urlencode({"space_id": sp, "limit": 30})
+        data = json.load(urllib.request.urlopen(urllib.request.Request(url,
+            headers={"Authorization": "Bearer " + at}), timeout=12))
+        msgs = data if isinstance(data, list) else data.get("messages", data.get("items", []))
+        prior = [m for m in msgs if _sender_key(m) == key and m.get("id") != cur]
+        prior = list(reversed(prior))[-4:]   # oldest -> newest of this sender's recent thread
+        if len(prior) < 2:
+            return  # nothing to read a throughline from
+        who = d.get("username") or d.get("display_name") or "sender"
+        parts = [(m.get("content") or "").replace("\n", " ").replace("\r", " ")[:90] for m in prior]
+        print(f"CONTEXT @{who} recent thread (read the throughline before replying, "
+              f"don't just answer the last line): " + " ⏵ ".join(parts), flush=True)
+    except Exception as e:
+        print(f"[listener] sender-context fetch failed: {e!r}", file=sys.stderr, flush=True)
 
 
 def stream():
@@ -286,6 +323,9 @@ def stream():
                     # the agent's spaces), so tag which space the mention came from.
                     sp = d.get("space_id") or "?"
                     print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}", flush=True)
+                    # Intent-aware: in the background (never delays the wake), surface
+                    # the sender's recent thread so the agent reads their throughline.
+                    threading.Thread(target=emit_sender_context, args=(d,), daemon=True).start()
                     post_processing_status(mid, "thinking", f"got your message — @{AGENT_HANDLE} is on it")
                     stop = threading.Event()
                     _pending[mid] = stop

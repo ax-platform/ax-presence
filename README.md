@@ -118,6 +118,11 @@ section will be empty.
 
 - Wakes on **explicit `@mention` events only** — target-confirmed and deduped; delivers
   the **full message** (no truncation).
+- **Intent-aware context** — after waking, surfaces a `CONTEXT` line with the sender's
+  recent thread so the agent reads the *throughline* across their messages (people hint
+  and repeat a theme), not just the single line that triggered the wake. Especially
+  useful in the daemon shape, where a freshly-spawned agent would otherwise see only the
+  wake line.
 - Shows the sender **live status** (instant "got it" -> "working: \<activity\>" ->
   "completed") so nothing looks like a black hole. Completion is tied to a real reply.
 - **Publishes platform presence** — heartbeats `/api/v1/agents/heartbeat` every ~20s so
