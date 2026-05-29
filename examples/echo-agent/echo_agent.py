@@ -176,18 +176,44 @@ def _post_reply(mid, space_id, text):
         print(f"[echo] reply failed: {e!r}", flush=True)
 
 
+NO_REPLY = "NO_REPLY"   # responder sentinel: abstain — post processing-status no_reply, send nothing
+
+
+def _status(mid, status, activity=None):
+    """Best-effort processing-status (thinking|working|completed|error|no_reply) so the
+    sender's progress bar resolves — never a black hole, never blocks the wake."""
+    try:
+        ax.post_processing_status(mid, status, activity)
+    except Exception as e:
+        print(f"[{RESPONDER_NAME}] status {status} failed: {e!r}", flush=True)
+
+
 def echo_reply(event):
-    """The wake callback: compute a reply via the selected RESPONDER (echo/claude/codex/
-    hermes), then post it — immediately, or after a timer delay (@-mentioning the sender)."""
+    """The wake callback: drive the full processing-status lifecycle and reply via the
+    selected RESPONDER (echo/claude/codex/hermes). A responder may ABSTAIN by returning
+    "" or NO_REPLY → we post status `no_reply` (the aX standard for "saw it, intentionally
+    not replying") and send no message. Immediate, or after a timer delay."""
     mid = event.payload.get("mid")
     content = event.payload.get("content") or ""
     space_id = event.payload.get("space_id") or ax.SPACE_ID
     who = event.payload.get("who") or "there"
+    _status(mid, "thinking", f"@{ax.AGENT_HANDLE} got it")   # instant receipt ack
 
     def build_and_post():
-        answer = RESPONDER(content, who)       # echo string | claude -p output | codex | hermes
-        text = f"@{who} ⏰ {DELAY}s — {answer}" if DELAY > 0 else answer
-        _post_reply(mid, space_id, text)
+        try:
+            _status(mid, "working", f"{RESPONDER_NAME} composing a reply")
+            answer = RESPONDER(content, who)             # echo string | claude -p | codex | hermes
+            ans = (answer or "").strip()
+            if not ans or ans == NO_REPLY:               # abstain → no_reply, no message
+                _status(mid, "no_reply", "intentionally not replying")
+                print(f"[{RESPONDER_NAME}] no_reply (abstained) for {mid}", flush=True)
+                return
+            text = f"@{who} ⏰ {DELAY}s — {ans}" if DELAY > 0 else ans
+            _post_reply(mid, space_id, text)
+            _status(mid, "completed", "replied")
+        except Exception as e:
+            _status(mid, "error", str(e)[:120])
+            print(f"[{RESPONDER_NAME}] error for {mid}: {e!r}", flush=True)
 
     if DELAY > 0:                              # timer mode: wait, then respond + @-mention sender
         print(f"[{RESPONDER_NAME}] timer armed: will reply to @{who} in {DELAY}s", flush=True)
@@ -205,6 +231,11 @@ def main():
     if not _access_token():
         print("[echo] no token after connect — aborting.", flush=True)
         sys.exit(1)
+    # Resolve our agent_id once and pin it into the listener config so processing-status
+    # (thinking/working/completed/no_reply) posts as THIS agent, not the placeholder.
+    aid = _agent_id()
+    if aid:
+        ax.AGENT_ID = aid
     # Step 2: heartbeat so the platform shows us connected/online.
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     # Step 3: echo loop on the shared monitor core (dedup + target-match for free).
