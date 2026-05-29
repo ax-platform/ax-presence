@@ -25,13 +25,20 @@ Run:
 """
 import os, sys, json, time, threading, urllib.request, urllib.parse, urllib.error
 
-# Make the repo-root modules importable no matter where we're launched from.
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+# Make the repo-root + this dir importable no matter where we're launched from.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+for _p in (_ROOT, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import ax_presence_listener as ax          # noqa: E402  (config + proven helpers)
 import monitor_core as mc                  # noqa: E402  (Event / Source / run)
+import responders                          # noqa: E402  (pluggable reply: echo/claude/codex/hermes)
+
+# Which runtime answers: AX_RESPONDER=echo (default smoke test) | claude | codex | hermes.
+RESPONDER_NAME = os.environ.get("AX_RESPONDER", "echo")
+RESPONDER = responders.get(RESPONDER_NAME)
 
 WHOAMI_URL = f"{ax.BASE}/api/v1/agents/me"
 _agent_id_cache = None
@@ -170,18 +177,24 @@ def _post_reply(mid, space_id, text):
 
 
 def echo_reply(event):
-    """The wake callback: echo the message back (immediately, or after a timer delay)."""
+    """The wake callback: compute a reply via the selected RESPONDER (echo/claude/codex/
+    hermes), then post it — immediately, or after a timer delay (@-mentioning the sender)."""
     mid = event.payload.get("mid")
     content = event.payload.get("content") or ""
     space_id = event.payload.get("space_id") or ax.SPACE_ID
     who = event.payload.get("who") or "there"
-    if DELAY > 0:                              # timer mode: wait, then reply + @-mention sender
-        text = (f"@{who} ⏰ {DELAY}s timer — you said: {content}" if content
-                else f"@{who} ⏰ {DELAY}s timer done ✅")
-        print(f"[echo] timer armed: will reply to @{who} in {DELAY}s", flush=True)
-        threading.Timer(DELAY, _post_reply, args=(mid, space_id, text)).start()
-    else:                                      # immediate echo
-        _post_reply(mid, space_id, f"echo: {content}" if content else "echo: 👋")
+
+    def build_and_post():
+        answer = RESPONDER(content, who)       # echo string | claude -p output | codex | hermes
+        text = f"@{who} ⏰ {DELAY}s — {answer}" if DELAY > 0 else answer
+        _post_reply(mid, space_id, text)
+
+    if DELAY > 0:                              # timer mode: wait, then respond + @-mention sender
+        print(f"[{RESPONDER_NAME}] timer armed: will reply to @{who} in {DELAY}s", flush=True)
+        threading.Timer(DELAY, build_and_post).start()
+    else:
+        # run the responder off the SSE pump thread so a slow LLM call never stalls intake
+        threading.Thread(target=build_and_post, daemon=True).start()
 
 
 def main():
