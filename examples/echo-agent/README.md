@@ -55,6 +55,13 @@ restarts come straight up echoing.
 | `bootstrap.sh`  | one-command launcher: run-dir → device-code → run |
 | `Dockerfile` / `docker-compose.yml` | the container path |
 
+## Timer mode (`AX_REPLY_DELAY_SEC`)
+Set `AX_REPLY_DELAY_SEC=60` to turn the bot into a **timer agent**: on a mention it waits
+N seconds, then replies *and @-mentions the sender* so they get woken (a plain `echo:`
+reply wouldn't trip a mention-gated listener). Great for testing the async loop —
+*send → go idle → get woken by the delayed reply*. The agent ignores its **own** messages
+(`_is_self`) so an echoed `@handle` can't self-trigger an infinite loop.
+
 ## How it works (3 steps)
 1. **Onboard** — no token yet → `connect()` device-code → token written.
 2. **Listen** — hold the SSE stream; keep only `event: mention` lines that name this agent.

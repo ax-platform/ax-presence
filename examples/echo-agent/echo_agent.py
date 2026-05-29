@@ -60,6 +60,16 @@ def _agent_id():
     return _agent_id_cache
 
 
+def _is_self(d):
+    """True if THIS agent authored the message. Critical: a responder must ignore its
+    own messages — echoing a reply that contains our own @handle would self-trigger an
+    infinite loop (caught live 2026-05-29: echo replied to its own reply)."""
+    sender = d.get("agent_id") or d.get("sender_id")
+    if sender and sender == _agent_id():
+        return True
+    return (d.get("agent_name") or d.get("username")) == ax.AGENT_HANDLE
+
+
 def _auth_headers(extra=None):
     h = {"Authorization": "Bearer " + (_access_token() or "")}
     aid = _agent_id()
@@ -115,7 +125,7 @@ class AxMentionSource:
                         except json.JSONDecodeError:
                             event = None
                             continue
-                        if ax.mentions_me(d):
+                        if ax.mentions_me(d) and not _is_self(d):
                             content = (d.get("content") or "").strip()
                             who = (d.get("username") or d.get("display_name")
                                    or d.get("agent_name") or d.get("sender_name") or "someone")
@@ -141,21 +151,37 @@ class AxMentionSource:
             backoff = min(backoff * 2, 30)
 
 
-def echo_reply(event):
-    """The wake callback: reply to the mention, echoing the message back."""
-    mid = event.payload.get("mid")
-    content = event.payload.get("content") or ""
-    space_id = event.payload.get("space_id") or ax.SPACE_ID
-    reply = f"echo: {content}" if content else "echo: 👋"
-    body = json.dumps({"content": reply, "space_id": space_id, "channel": "main",
+# AX_REPLY_DELAY_SEC>0 turns the echo bot into a TIMER agent: it waits N seconds,
+# then replies AND @-mentions the sender so they get woken (a plain "echo:" reply
+# wouldn't trip a mention-gated listener). Default 0 = immediate echo.
+DELAY = int(os.environ.get("AX_REPLY_DELAY_SEC", "0") or 0)
+
+
+def _post_reply(mid, space_id, text):
+    body = json.dumps({"content": text, "space_id": space_id, "channel": "main",
                        "message_type": "text", "parent_id": mid}).encode()
     req = urllib.request.Request(ax.MESSAGES_URL, data=body, method="POST",
                                  headers=_auth_headers({"Content-Type": "application/json"}))
     try:
         urllib.request.urlopen(req, timeout=15)
-        print(f"[echo] replied to {event.payload.get('who')}: {reply}", flush=True)
+        print(f"[echo] replied (parent={mid}): {text[:90]}", flush=True)
     except Exception as e:
         print(f"[echo] reply failed: {e!r}", flush=True)
+
+
+def echo_reply(event):
+    """The wake callback: echo the message back (immediately, or after a timer delay)."""
+    mid = event.payload.get("mid")
+    content = event.payload.get("content") or ""
+    space_id = event.payload.get("space_id") or ax.SPACE_ID
+    who = event.payload.get("who") or "there"
+    if DELAY > 0:                              # timer mode: wait, then reply + @-mention sender
+        text = (f"@{who} ⏰ {DELAY}s timer — you said: {content}" if content
+                else f"@{who} ⏰ {DELAY}s timer done ✅")
+        print(f"[echo] timer armed: will reply to @{who} in {DELAY}s", flush=True)
+        threading.Timer(DELAY, _post_reply, args=(mid, space_id, text)).start()
+    else:                                      # immediate echo
+        _post_reply(mid, space_id, f"echo: {content}" if content else "echo: 👋")
 
 
 def main():
