@@ -108,6 +108,36 @@ def post_processing_status(mid, status, activity=None):
         print(f"[listener] processing-status post failed: {e!r}", file=sys.stderr, flush=True)
 
 
+def post_message(content, parent_id=None, space_id=None):
+    """The easy 'respond to a side question / give an update' primitive.
+
+    Posts a message (a threaded reply when parent_id is set), then RE-FETCHES to
+    confirm it actually landed — a 2xx alone has silently lied before. Returns the
+    new message id (or None). Drives the --reply / --say one-shots so an agent can
+    answer a mention in one line instead of hand-rolling a REST call."""
+    at = load_tok().get("access_token")
+    payload = {"content": content, "space_id": space_id or SPACE_ID,
+               "channel": "main", "message_type": "text"}
+    if parent_id:
+        payload["parent_id"] = parent_id
+    try:
+        req = urllib.request.Request(MESSAGES_URL, data=json.dumps(payload).encode(), method="POST",
+            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.load(r)
+        mid = (d.get("message") or d).get("id")
+    except Exception as e:
+        print(f"[send] failed: {e!r}", flush=True)
+        return None
+    try:                                  # verify it landed; never trust the 2xx alone
+        vr = urllib.request.Request(f"{MESSAGES_URL}/{mid}", headers={"Authorization": "Bearer " + at})
+        urllib.request.urlopen(vr, timeout=15)
+        print(f"[send] delivered (id={mid})", flush=True)
+    except Exception:
+        print(f"[send] posted (id={mid}) but re-fetch failed — verify in app", flush=True)
+    return mid
+
+
 def _fmt_elapsed(secs):
     """Human 'how long': 45s, 2m10s, 1h03m."""
     secs = int(secs)
@@ -448,7 +478,12 @@ def stream():
                     # Cross-space awareness: the SSE stream is token-scoped (delivers ALL
                     # the agent's spaces), so tag which space the mention came from.
                     sp = d.get("space_id") or "?"
-                    print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}", flush=True)
+                    # One stdout write (the wake) — content newlines are already flattened, so
+                    # the only newline is the respond-hint: tells you exactly how to reply.
+                    _self = os.path.basename(__file__)
+                    print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}"
+                          f"\n  ↩ respond: python3 {_self} --reply {mid} \"your reply\"   ·   update: --say \"…\"",
+                          flush=True)
                     # Intent-aware: in the background (never delays the wake), surface
                     # the sender's recent thread so the agent reads their throughline.
                     threading.Thread(target=emit_sender_context, args=(d,), daemon=True).start()
@@ -666,4 +701,16 @@ if __name__ == "__main__":
         when, msg = sys.argv[i + 1], " ".join(sys.argv[i + 2:]) or "(reminder)"
         add_reminder(when, msg)
         sys.exit(0)
+    if "--reply" in sys.argv:                 # quick threaded reply to a mention
+        i = sys.argv.index("--reply")
+        if len(sys.argv) <= i + 2:
+            print('usage: --reply <message_id> <text…>', flush=True); sys.exit(2)
+        mid, text = sys.argv[i + 1], " ".join(sys.argv[i + 2:])
+        sys.exit(0 if post_message(text, parent_id=mid) else 1)
+    if "--say" in sys.argv:                   # quick standalone message / status update
+        i = sys.argv.index("--say")
+        text = " ".join(sys.argv[i + 1:])
+        if not text:
+            print('usage: --say <text…>', flush=True); sys.exit(2)
+        sys.exit(0 if post_message(text) else 1)
     main()
