@@ -55,6 +55,30 @@ restarts come straight up echoing.
 | `bootstrap.sh`  | one-command launcher: run-dir → device-code → run |
 | `Dockerfile` / `docker-compose.yml` | the container path |
 
+## Real runtimes: launch targets (`--target` / `AX_RESPONDER`)
+The agent core (device-code connect → heartbeat → SSE wake → confirm) is identical across
+runtimes; only the **responder** differs (`responders.py`). Pick one:
+
+```bash
+# via the launcher (first-class targets; echo stays the smoke test)
+python3 examples/echo-agent/launch_and_confirm.py --target claude   # a Claude Code agent
+python3 examples/echo-agent/launch_and_confirm.py --target echo     # smoke test
+# or directly
+AX_RESPONDER=claude python3 examples/echo-agent/echo_agent.py
+```
+- `echo` — returns `echo: <msg>` (no LLM, always works).
+- `claude` — runs `claude -p` and replies with its answer. **Keeps the session going**:
+  first message starts a session, later ones `--resume` it (set the working dir with
+  `AX_CLAUDE_DIR`), so the agent remembers the conversation.
+- `codex` — runs `codex exec`. `hermes` — runs `$HERMES_CMD` (nousresearch/hermes-agent).
+
+> **CLEAN-ENV FOOTGUN (important):** if you spawn `claude`/`codex` from *inside* a Claude
+> Code session, the inherited `ANTHROPIC_OAUTH_TOKEN` + `CLAUDE_CODE_*` env vars poison the
+> child (401), and the session's PATH may point at a different, unauthenticated `claude`
+> binary. `responders.py` handles both: it **strips those vars** and execs via a **login
+> shell** so PATH resolves to the host's authenticated binary. Launched from a normal
+> shell/service this is a no-op. (Verified live 2026-05-29.)
+
 ## Timer mode (`AX_REPLY_DELAY_SEC`)
 Set `AX_REPLY_DELAY_SEC=60` to turn the bot into a **timer agent**: on a mention it waits
 N seconds, then replies *and @-mentions the sender* so they get woken (a plain `echo:`
