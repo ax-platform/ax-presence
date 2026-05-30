@@ -26,7 +26,7 @@ Capabilities (each one cost a real bug or a real UX lesson to learn):
     the sponsor on sustained failure or exit; a heartbeat file lets an external
     watchdog catch silent process death (crash/OOM/SIGKILL).
 """
-import json, os, time, sys, threading, atexit, signal
+import json, os, time, sys, threading, atexit, signal, fcntl
 import urllib.request, urllib.parse, urllib.error
 
 # --- Per-agent config (set these, or override via AX_* env vars) -------------
@@ -658,7 +658,29 @@ def home_digest():
     return 0
 
 
+_LOCK_FH = None
+def _acquire_singleton_lock():
+    """Refuse to start a SECOND listener for this handle. The multi-monitor token-race:
+    two same-handle listeners share the single-use rotating token file, so each refresh
+    invalidates the other -> they 401 and SIGTERM each other (cost daimon a 401 crash-loop;
+    SIGTERM'd stack + widget_smith). One flock per handle prevents it. flock auto-releases
+    on process death, so a crashed/killed listener frees the lock for a clean restart."""
+    global _LOCK_FH
+    lock_path = os.path.expanduser(f"~/.ax/{AGENT_HANDLE}-listener.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"[lock] another @{AGENT_HANDLE} listener already holds {lock_path} — "
+              f"refusing to start a second (token-race guard). Exiting.", flush=True)
+        sys.exit(0)
+    fh.write(str(os.getpid())); fh.flush()
+    _LOCK_FH = fh  # held for the process lifetime; released automatically on exit
+
+
 def main():
+    _acquire_singleton_lock()
     _install_exit_alert()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
