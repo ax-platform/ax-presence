@@ -67,6 +67,8 @@ SCOPE        = "openid offline_access ax-api/mcp:read ax-api/mcp:write"
 MESSAGES_URL = f"{BASE}/api/v1/messages"
 PROCESSING_URL = f"{BASE}/api/v1/agents/processing-status"
 HEARTBEAT_URL = f"{BASE}/api/v1/agents/heartbeat"  # platform liveness (server TTL ~30s)
+SIGNAL_URL   = f"{BASE}/internal/agent-signal"      # ALC signal-store (stack); X-API-Key auth, Redis 90s TTL
+SIGNAL_API_KEY = os.environ.get("AX_INTERNAL_SIGNAL_KEY") or os.environ.get("INTERNAL_DISPATCH_API_KEY")
 
 _refresh_lock = threading.Lock()
 _seen_ids = set()       # dedup: same msg arrives as both 'message' and 'mention'
@@ -236,6 +238,20 @@ def heartbeat_loop():
                 json.dump(sig, sf)
         except Exception:
             pass
+        # Push the same signal to the backend signal-store (the ALC sweep reads THIS — a
+        # backend on another box can't read the local file). Separate X-API-Key auth, NOT
+        # the agent's rotating token, so a 401-broken agent can STILL report currently_401
+        # (resolves the chicken-egg). Best-effort; 404s harmlessly until the endpoint deploys.
+        if SIGNAL_API_KEY:
+            try:
+                sbody = json.dumps({"agent_id": AGENT_ID, "currently_401": _currently_401,
+                    "responsiveness_ratio": (round(_replies_sent / _mentions_seen, 3) if _mentions_seen else None),
+                    "mentions_seen": _mentions_seen, "replies_sent": _replies_sent,
+                    "last_reply_at": _last_reply_at}).encode()
+                urllib.request.urlopen(urllib.request.Request(SIGNAL_URL, data=sbody, method="POST",
+                    headers={"X-API-Key": SIGNAL_API_KEY, "Content-Type": "application/json"}), timeout=10)
+            except Exception:
+                pass  # never block the heartbeat
         time.sleep(30)
 
 
