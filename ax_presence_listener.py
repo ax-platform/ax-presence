@@ -67,12 +67,17 @@ SCOPE        = "openid offline_access ax-api/mcp:read ax-api/mcp:write"
 MESSAGES_URL = f"{BASE}/api/v1/messages"
 PROCESSING_URL = f"{BASE}/api/v1/agents/processing-status"
 HEARTBEAT_URL = f"{BASE}/api/v1/agents/heartbeat"  # platform liveness (server TTL ~30s)
+SIGNAL_URL   = f"{BASE}/internal/agent-signal"      # ALC signal-store (stack); X-API-Key auth, Redis 90s TTL
+SIGNAL_API_KEY = os.environ.get("AX_INTERNAL_SIGNAL_KEY") or os.environ.get("INTERNAL_DISPATCH_API_KEY")
 
 _refresh_lock = threading.Lock()
 _seen_ids = set()       # dedup: same msg arrives as both 'message' and 'mention'
 _alerted_exit = False   # exit alert fires at most once
 _connected = False
 _mentions_seen = 0
+_replies_sent = 0          # productivity signal: replies/posts this listener has landed
+_last_reply_at = 0         # epoch of the last successful reply/post (0 = none yet)
+_currently_401 = False     # token currently rejected (mute/broken) — distinct from dormant
 _pending = {}           # message_id -> threading.Event, set when this agent's reply lands
 HOME_FEED_MAX = 200     # cap the rolling cross-space feed buffer so the file stays small
 _home_feed = []         # in-memory rolling list of recent cross-space events (newest last)
@@ -126,6 +131,9 @@ def post_message(content, parent_id=None, space_id=None):
         with urllib.request.urlopen(req, timeout=20) as r:
             d = json.load(r)
         mid = (d.get("message") or d).get("id")
+        globals()["_replies_sent"] += 1               # productivity signal
+        globals()["_last_reply_at"] = int(time.time())
+        globals()["_currently_401"] = False           # a landed post proves auth works
     except Exception as e:
         print(f"[send] failed: {e!r}", flush=True)
         return None
@@ -216,8 +224,34 @@ def heartbeat_loop():
             fd = os.open(HEARTBEAT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(str(int(time.time())))
+            # Productivity signal record for the agent-lifecycle sweep: the
+            # CURRENTLY-functional dimension last_active_at (backward-looking) can't see.
+            # Lets the ladder route 'present-but-mute/401-broken' to FIX, not archive.
+            sig = {"handle": AGENT_HANDLE, "ts": int(time.time()), "connected": _connected,
+                   "currently_401": _currently_401, "mentions_seen": _mentions_seen,
+                   "replies_sent": _replies_sent, "last_reply_at": _last_reply_at,
+                   "responsiveness_ratio": (round(_replies_sent / _mentions_seen, 3)
+                                            if _mentions_seen else None)}
+            sp = os.path.expanduser(f"~/.ax/{AGENT_HANDLE}-signal.json")
+            sfd = os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(sfd, "w") as sf:
+                json.dump(sig, sf)
         except Exception:
             pass
+        # Push the same signal to the backend signal-store (the ALC sweep reads THIS — a
+        # backend on another box can't read the local file). Separate X-API-Key auth, NOT
+        # the agent's rotating token, so a 401-broken agent can STILL report currently_401
+        # (resolves the chicken-egg). Best-effort; 404s harmlessly until the endpoint deploys.
+        if SIGNAL_API_KEY:
+            try:
+                sbody = json.dumps({"agent_id": AGENT_ID, "currently_401": _currently_401,
+                    "responsiveness_ratio": (round(_replies_sent / _mentions_seen, 3) if _mentions_seen else None),
+                    "mentions_seen": _mentions_seen, "replies_sent": _replies_sent,
+                    "last_reply_at": _last_reply_at}).encode()
+                urllib.request.urlopen(urllib.request.Request(SIGNAL_URL, data=sbody, method="POST",
+                    headers={"X-API-Key": SIGNAL_API_KEY, "Content-Type": "application/json"}), timeout=10)
+            except Exception:
+                pass  # never block the heartbeat
         time.sleep(30)
 
 
@@ -447,6 +481,7 @@ def stream():
     })
     r = urllib.request.urlopen(req, timeout=None)
     globals()["_connected"] = True
+    globals()["_currently_401"] = False
     print(f"[status] SSE connected, watching for @{AGENT_HANDLE} mentions", flush=True)
     event = None
     for raw in r:
@@ -695,6 +730,7 @@ def main():
         except urllib.error.HTTPError as e:
             consecutive_failures += 1
             if e.code == 401:
+                globals()["_currently_401"] = True     # mute/broken signal for the lifecycle sweep
                 print("[status] 401 -> refreshing token and reconnecting", flush=True)
                 try:
                     refresh()
