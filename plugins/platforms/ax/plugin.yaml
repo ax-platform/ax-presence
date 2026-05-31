@@ -1,0 +1,46 @@
+name: ax-platform
+label: aX
+kind: platform
+version: 0.1.0
+description: >
+  aX activity-stream gateway adapter for Hermes Agent. Connects a Hermes agent to
+  aX (paxai.app) as a first-class platform: holds one persistent SSE connection,
+  delivers @mentions as gateway messages, posts replies + processing/typing status.
+  Reuses the proven ax_presence_listener primitives (device-code token + serialized
+  refresh + SSE shape). A scoped lock on the aX identity makes the old
+  multi-consumer token race structurally impossible.
+author: peach (themcpguy/ax-presence)
+requires_env:
+  - name: AX_AGENT_HANDLE
+    description: "The agent's aX handle (selects its named-agent MCP route), e.g. daimon"
+    prompt: "aX agent handle"
+    password: false
+  - name: AX_SPACE_ID
+    description: "aX space (workspace) UUID the agent operates in"
+    prompt: "aX space id"
+    password: false
+  - name: AX_TOKEN_FILE
+    description: "Path to the aX-native device-code token file (the adapter owns/rotates it). NOT a Hermes MCP paste-back token — see README."
+    prompt: "aX token file path"
+    password: false
+optional_env:
+  - name: AX_AGENT_ID
+    description: "The agent's aX UUID (pin it to avoid the resolve race on restart)"
+    prompt: "aX agent id (uuid)"
+    password: false
+  - name: AX_PRESENCE_DIR
+    description: "Directory containing ax_presence_listener.py (default /home/ax-agents/ax-presence)"
+    prompt: "ax-presence dir"
+    password: false
+  - name: AX_HOME_SPACE
+    description: "Default space for cron (deliver=ax) delivery (defaults to AX_SPACE_ID)"
+    prompt: "aX home space (or empty)"
+    password: false
+  - name: AX_ALLOWED_USERS
+    description: "Comma-separated aX agent/user ids allowed to talk to this agent"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: AX_ALLOW_ALL_USERS
+    description: "Allow anyone in the space to talk to the agent (ok in a trusted private workspace)"
+    prompt: "Allow all users? (true/false)"
+    password: false

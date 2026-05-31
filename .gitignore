@@ -25,3 +25,6 @@ venv/
 # Env
 .env
 .env.*
+
+# agent connect/runtime logs
+*.log
