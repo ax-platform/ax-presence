@@ -201,6 +201,9 @@ class AXAdapter(BasePlatformAdapter):
                         self._seen_ids.add(mid)
                         if len(self._seen_ids) > 5000:
                             self._seen_ids.clear()
+                        if self._is_no_reply_safe_word(d):
+                            self._mark_no_reply(d)
+                            continue
                         self._dispatch(d)
                     elif line == "":
                         event = None
@@ -210,6 +213,66 @@ class AXAdapter(BasePlatformAdapter):
                 logger.warning("aX: SSE dropped (%r) — reconnect in %.0fs", e, backoff)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+
+    _HANDLE_RE = r"@[-A-Za-z0-9_]+"
+    # Safe-word convention for intentional silence. Match only messages whose
+    # command content is the exact phrase "no reply" or "no-reply"
+    # (case-insensitive), allowing only surrounding @handles and punctuation.
+    # Do not trigger on longer text that merely contains the words, e.g.
+    # "no reply needed".
+    _NO_REPLY_RE = re.compile(
+        rf"^\s*(?:{_HANDLE_RE}[\s,:;\-—–]+)*no[\s-]+reply(?:[\s,:;\-—–]+{_HANDLE_RE})*\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    )
+    # Outbound responder sentinel convention. If a wrapped/headless agent returns
+    # only one of these tokens, it is expressing an abstention/no-reply intent;
+    # the adapter must translate it into the aX quiet/skipped status instead of
+    # posting the token as chat text.
+    _NO_REPLY_OUTPUT_RE = re.compile(
+        r"^\s*(?:no[\s_-]?reply|NO_REPLY)\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_no_reply_safe_word(cls, d: dict) -> bool:
+        """True when the inbound message explicitly says no model reply is wanted."""
+        return bool(cls._NO_REPLY_RE.search(str(d.get("content") or "")))
+
+    @classmethod
+    def _is_no_reply_output_sentinel(cls, content: str) -> bool:
+        """True when the agent's final output is exactly a no-reply sentinel."""
+        return bool(cls._NO_REPLY_OUTPUT_RE.search(str(content or "")))
+
+    def _mark_no_reply(self, d: dict) -> None:
+        """Publish a visible no-reply status on the triggering message.
+
+        The aX backend maps processing-status ``status=skipped`` plus
+        ``detail.reason_code=no_reply`` onto the same persisted
+        ``metadata.ui.signals.agent_skipped[]`` label path used by automatic
+        quiet exits. This creates the UI close-out without creating a chat reply.
+        """
+        mid = d.get("id")
+        if not mid:
+            return
+        try:
+            ax.post_processing_status(
+                mid,
+                "skipped",
+                activity="no reply",
+                detail={
+                    "reason": "no reply",
+                    "label": "no reply",
+                    "reason_code": "no_reply",
+                    "signal_kind": "no_reply",
+                    "safe_word": "no reply/no-reply",
+                    "signal_only": True,
+                    "emoji": "",
+                },
+            )
+            logger.info("aX: suppressed no-reply safe-word mention %s", mid)
+        except Exception as e:
+            logger.warning("aX: failed to mark no-reply safe-word mention %s: %r", mid, e)
 
     def _resolve_sender_name(self, d: dict) -> str:
         """Return the sender's real display name. The SSE mention event omits it,
@@ -299,6 +362,16 @@ class AXAdapter(BasePlatformAdapter):
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         loop = asyncio.get_running_loop()
+        # Agent abstention sentinel → quiet/skipped status, not a chat message.
+        # This covers headless/wrapped responders whose only way to signal "do
+        # not answer" is a final token such as "NO_REPLY" / "no-reply".
+        if self._is_no_reply_output_sentinel(content):
+            mid = self._last_mid.get(chat_id)
+            if mid:
+                await loop.run_in_executor(None, self._mark_no_reply, {"id": mid})
+            else:
+                logger.info("aX: suppressed no-reply output sentinel without inbound message id")
+            return SendResult(success=True, message_id="no_reply")
         # Tool-progress → activity box on the user's message (not a chat message).
         # Only the agent's final reply is posted as an actual aX message.
         if self._looks_like_progress(content):
