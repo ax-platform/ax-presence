@@ -315,6 +315,12 @@ class AXAdapter(BasePlatformAdapter):
             chat_type="group",
             user_id=str(d.get("agent_id") or d.get("sender_id") or who),
             user_name=str(who),
+            # Treat the triggering aX message as the platform thread/activity
+            # anchor. Hermes only includes metadata for status/interim/tool
+            # updates when source.thread_id is present; without this, runtime
+            # status callbacks can fall back to normal chat sends.
+            thread_id=mid,
+            message_id=mid,
         )
         event = MessageEvent(
             text=d.get("content") or "",
@@ -337,18 +343,47 @@ class AXAdapter(BasePlatformAdapter):
     # Tool names are lowercase by convention, which keeps prose like '✅ Done:'
     # from matching. These belong in the activity box, NOT as chat messages.
     _PROGRESS_RE = re.compile(r'^\s*[^\w\s@#]\S*\s+[a-z][\w.\-]*\s*(:|\(|\.\.\.)')
+    # Gateway/runtime status can also arrive through adapter.send() on fallback
+    # paths (stream/interim/status compatibility, or older Hermes callers). These
+    # are not final assistant replies and should be rendered as original-message
+    # activity. Keep this deliberately narrow: recognizable gateway status emoji
+    # prefixes plus exact operational phrases, not arbitrary assistant prose.
+    _ACTIVITY_STATUS_RE = re.compile(
+        r"^\s*(?:"
+        r"🗜️\s*Compacting context\b"
+        r"|⚠️\s*\*\*Dangerous command requires approval:\*\*"
+        r"|⏳\s*(?:Waiting|Still working|Continuing)\b"
+        r"|🔄\s*(?:Retrying|Continuing)\b"
+        r"|🧠\s*(?:Thinking|Reasoning)\b"
+        r")",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def _looks_like_progress(cls, content: str) -> bool:
         if not content or len(content) > 800:
             return False
         first = next((l for l in content.splitlines() if l.strip()), "")
-        return bool(cls._PROGRESS_RE.match(first))
+        return bool(cls._PROGRESS_RE.match(first) or cls._ACTIVITY_STATUS_RE.match(first))
 
-    def _post_activity(self, chat_id: str, content: str) -> None:
+    def _message_id_from_metadata(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Resolve the original aX message id that should own activity/status.
+
+        Hermes gateway status/progress callbacks may carry platform metadata. If
+        it includes an explicit message id, prefer that over the chat-wide latest
+        mention so concurrent runs do not attach activity to the wrong message.
+        """
+        if isinstance(metadata, dict):
+            for key in ("message_id", "reply_to_message_id", "thread_id", "telegram_reply_to_message_id"):
+                value = metadata.get(key)
+                if value:
+                    return str(value)
+        return self._last_mid.get(chat_id)
+
+    def _post_activity(self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Push the freshest tool-progress line into the activity box on the
         sender's message (processing-status) — blocking; call via executor."""
-        mid = self._last_mid.get(chat_id)
+        mid = self._message_id_from_metadata(chat_id, metadata)
         if not mid:
             return
         line = next((l.strip() for l in reversed(content.splitlines()) if l.strip()),
@@ -358,6 +393,35 @@ class AXAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def send_or_update_status(self, chat_id: str, status_key: str, content: str,
+                                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Route Hermes gateway status callbacks to original-message activity.
+
+        Without this method, gateway/run.py falls back to adapter.send(), which
+        can post context-pressure/approval/runtime status as ordinary aX messages.
+        """
+        mid = self._message_id_from_metadata(chat_id, metadata)
+        if not mid:
+            logger.info("aX: suppressed gateway status without inbound message id: %s", status_key)
+            return SendResult(success=True, message_id="status")
+        line = next((l.strip() for l in reversed(str(content or "").splitlines()) if l.strip()),
+                    str(content or "").strip())
+        if not line:
+            return SendResult(success=True, message_id="status")
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: ax.post_processing_status(
+                    mid,
+                    "working",
+                    line[:200],
+                    detail={"status_key": str(status_key), "signal_kind": "gateway_status"},
+                ),
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        return SendResult(success=True, message_id="status")
+
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -366,7 +430,7 @@ class AXAdapter(BasePlatformAdapter):
         # This covers headless/wrapped responders whose only way to signal "do
         # not answer" is a final token such as "NO_REPLY" / "no-reply".
         if self._is_no_reply_output_sentinel(content):
-            mid = self._last_mid.get(chat_id)
+            mid = self._message_id_from_metadata(chat_id, metadata)
             if mid:
                 await loop.run_in_executor(None, self._mark_no_reply, {"id": mid})
             else:
@@ -375,7 +439,7 @@ class AXAdapter(BasePlatformAdapter):
         # Tool-progress → activity box on the user's message (not a chat message).
         # Only the agent's final reply is posted as an actual aX message.
         if self._looks_like_progress(content):
-            await loop.run_in_executor(None, self._post_activity, chat_id, content)
+            await loop.run_in_executor(None, self._post_activity, chat_id, content, metadata)
             return SendResult(success=True, message_id="activity")
         try:
             mid = await loop.run_in_executor(
@@ -410,7 +474,7 @@ class AXAdapter(BasePlatformAdapter):
         lives in the channel and the tools show up in the message's activity box.
         """
         await asyncio.get_running_loop().run_in_executor(
-            None, self._post_activity, chat_id, content)
+            None, self._post_activity, chat_id, content, metadata)
         return SendResult(success=True, message_id=message_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

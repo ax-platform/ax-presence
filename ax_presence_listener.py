@@ -98,14 +98,32 @@ def alert(text):
         print(f"[listener] alert POST failed (in-session wake still fired): {e!r}", file=sys.stderr, flush=True)
 
 
-def post_processing_status(mid, status, activity=None):
+def build_processing_body(mid, status, activity=None, tool_name=None, progress=None, detail=None):
+    """Build the processing-status body from safe, UI-facing fields only."""
+    body = {"message_id": mid, "status": status, "agent_name": AGENT_HANDLE}
+    if activity:
+        body["activity"] = activity
+    if tool_name:
+        body["tool_name"] = str(tool_name)
+    if progress is not None:
+        try:
+            cur = int(progress.get("current"))
+            tot = int(progress.get("total"))
+            unit = progress.get("unit")
+            body["progress"] = {"current": cur, "total": tot, "unit": str(unit) if unit else "steps"}
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if isinstance(detail, dict) and detail:
+        body["detail"] = detail
+    return body
+
+
+def post_processing_status(mid, status, activity=None, tool_name=None, progress=None, detail=None):
     """Publish an agent_processing event so the SENDER's progress bar shows
     receipt/progress (no black hole). Best-effort — never blocks the wake."""
     try:
         at = load_tok().get("access_token")
-        body = {"message_id": mid, "status": status, "agent_name": AGENT_HANDLE}
-        if activity:
-            body["activity"] = activity
+        body = build_processing_body(mid, status, activity, tool_name, progress, detail)
         urllib.request.urlopen(urllib.request.Request(PROCESSING_URL, data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
                      "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID}), timeout=10)
