@@ -85,6 +85,11 @@ class AXAdapter(BasePlatformAdapter):
         # "someone" and get confused about who it's talking to (R7). We resolve
         # the real name via a one-shot REST lookup of the message and cache it.
         self._name_cache: Dict[str, str] = {}
+        # Agent-to-agent loop guard: keep a tiny per-sender window so short
+        # acknowledgement ping-pongs ("@peach roger." / "@canary roger.") do
+        # not burn model calls indefinitely. Human messages are never gated by
+        # this path because aX user messages do not carry agent_id.
+        self._agent_ack_window: Dict[str, List[float]] = {}
 
     @property
     def name(self) -> str:
@@ -136,6 +141,13 @@ class AXAdapter(BasePlatformAdapter):
         self._refresh_thread = threading.Thread(
             target=ax.proactive_refresh_loop, name="ax-refresh", daemon=True)
         self._refresh_thread.start()
+        # Platform heartbeat (POST /api/v1/agents/heartbeat ~every 20s) so the
+        # agent shows Online in the availability views. Without this a live
+        # gateway agent reads Dormant/Offline (it never POSTs liveness). Uses
+        # AGENT_ID/SPACE_ID from env — no dependence on listener stream globals.
+        self._heartbeat_thread = threading.Thread(
+            target=ax.presence_loop, name="ax-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
         # Blocking SSE reader -> bridges events onto the asyncio loop.
         self._reader_thread = threading.Thread(
             target=self._sse_reader, name="ax-sse", daemon=True)
@@ -204,6 +216,8 @@ class AXAdapter(BasePlatformAdapter):
                         if self._is_no_reply_safe_word(d):
                             self._mark_no_reply(d)
                             continue
+                        if self._is_agent_ack_loop_candidate(d):
+                            continue
                         self._dispatch(d)
                     elif line == "":
                         event = None
@@ -214,8 +228,18 @@ class AXAdapter(BasePlatformAdapter):
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
-
+    _ACK_WORD_RE = r"(?:roger|ack(?:nowledged)?|aligned|standing by|sounds good|noted|thanks|thank you|copy|copied|received|seen|confirmed|affirmative|ok(?:ay)?)"
     _HANDLE_RE = r"@[-A-Za-z0-9_]+"
+    _ACK_LOOP_RE = re.compile(
+        rf"^\s*(?:{_HANDLE_RE}[\s,:;\-—–]*)*{_ACK_WORD_RE}\b[\s.!?,:;\-—–]*(?:{_HANDLE_RE}\b[\s.!?,:;\-—–]*)*$",
+        re.IGNORECASE,
+    )
+    _ACK_WITH_HANDLE_RE = re.compile(
+        rf"(?:^|\s){_ACK_WORD_RE}\b|{_HANDLE_RE}",
+        re.IGNORECASE,
+    )
+    _SHORT_AGENT_MENTION_WINDOW_SECONDS = 45
+    _SHORT_AGENT_MENTION_THRESHOLD = 2
     # Safe-word convention for intentional silence. Match only messages whose
     # command content is the exact phrase "no reply" or "no-reply"
     # (case-insensitive), allowing only surrounding @handles and punctuation.
@@ -274,6 +298,56 @@ class AXAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("aX: failed to mark no-reply safe-word mention %s: %r", mid, e)
 
+    def _is_agent_ack_loop_candidate(self, d: dict) -> bool:
+        """Return True when an inbound agent mention looks like ping-pong noise.
+
+        The adapter must still allow meaningful agent-to-agent handoffs, but it
+        should never spend unbounded model calls on repeating acknowledgements.
+        We therefore drop:
+        - short acknowledgement-only mentions from another aX agent, even when
+          the @handle appears before or after the ack word; and
+        - the 2nd short agent mention from the same sender within 45s, before a
+          three-message ping-pong can form.
+        Human/user messages are not affected because they do not carry agent_id.
+        """
+        sender_agent = str(d.get("agent_id") or "")
+        if not sender_agent:
+            return False
+        text = str(d.get("content") or "").strip()
+        compact = " ".join(text.split())
+        if len(compact) <= 160 and self._is_short_agent_ack_mention(compact):
+            logger.info("aX: suppressed agent short-ack mention from %s: %.120r", sender_agent, compact)
+            return True
+
+        # Fallback burst guard for short agent-to-agent mentions even if wording
+        # differs from the explicit ack regex. Threshold 2 makes the guard
+        # preventive: the second short peer mention is suppressed before a third
+        # message can establish a cascade.
+        if len(compact) <= 220:
+            now = time.time()
+            window = [
+                t for t in self._agent_ack_window.get(sender_agent, [])
+                if now - t < self._SHORT_AGENT_MENTION_WINDOW_SECONDS
+            ]
+            window.append(now)
+            self._agent_ack_window[sender_agent] = window[-10:]
+            if len(window) >= self._SHORT_AGENT_MENTION_THRESHOLD:
+                logger.warning(
+                    "aX: suppressed possible agent-to-agent loop from %s (%d short mentions in %ds)",
+                    sender_agent, len(window), self._SHORT_AGENT_MENTION_WINDOW_SECONDS,
+                )
+                return True
+        return False
+
+    @classmethod
+    def _is_short_agent_ack_mention(cls, compact: str) -> bool:
+        """True for short peer ack mentions that contain no substantive text."""
+        if not cls._ACK_LOOP_RE.match(compact):
+            return False
+        remainder = cls._ACK_WITH_HANDLE_RE.sub(" ", compact)
+        remainder = re.sub(r"[\s.!?,:;\-—–]+", "", remainder)
+        return remainder == ""
+
     def _resolve_sender_name(self, d: dict) -> str:
         """Return the sender's real display name. The SSE mention event omits it,
         so fall back to a one-shot REST lookup of the message (cached by id)."""
@@ -315,6 +389,13 @@ class AXAdapter(BasePlatformAdapter):
             chat_type="group",
             user_id=str(d.get("agent_id") or d.get("sender_id") or who),
             user_name=str(who),
+            # Treat the triggering aX message as the platform thread/activity
+            # anchor. Hermes only includes metadata for status/interim/tool
+            # updates when source.thread_id is present; without this, runtime
+            # status callbacks either fall back to chat-wide latest-message state
+            # or, on older adapters, leak as normal stream messages.
+            thread_id=mid,
+            message_id=mid,
         )
         event = MessageEvent(
             text=d.get("content") or "",
@@ -337,18 +418,47 @@ class AXAdapter(BasePlatformAdapter):
     # Tool names are lowercase by convention, which keeps prose like '✅ Done:'
     # from matching. These belong in the activity box, NOT as chat messages.
     _PROGRESS_RE = re.compile(r'^\s*[^\w\s@#]\S*\s+[a-z][\w.\-]*\s*(:|\(|\.\.\.)')
+    # Gateway/runtime status can also arrive through adapter.send() on fallback
+    # paths (stream/interim/status compatibility, or older Hermes callers). These
+    # are not final assistant replies and should be rendered as original-message
+    # activity. Keep this deliberately narrow: recognizable gateway status emoji
+    # prefixes plus exact operational phrases, not arbitrary assistant prose.
+    _ACTIVITY_STATUS_RE = re.compile(
+        r"^\s*(?:"
+        r"🗜️\s*Compacting context\b"
+        r"|⚠️\s*\*\*Dangerous command requires approval:\*\*"
+        r"|⏳\s*(?:Waiting|Still working|Continuing)\b"
+        r"|🔄\s*(?:Retrying|Continuing)\b"
+        r"|🧠\s*(?:Thinking|Reasoning)\b"
+        r")",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def _looks_like_progress(cls, content: str) -> bool:
         if not content or len(content) > 800:
             return False
         first = next((l for l in content.splitlines() if l.strip()), "")
-        return bool(cls._PROGRESS_RE.match(first))
+        return bool(cls._PROGRESS_RE.match(first) or cls._ACTIVITY_STATUS_RE.match(first))
 
-    def _post_activity(self, chat_id: str, content: str) -> None:
+    def _message_id_from_metadata(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Resolve the original aX message id that should own activity/status.
+
+        Hermes gateway status/progress callbacks may carry platform metadata. If
+        it includes an explicit message id, prefer that over the chat-wide latest
+        mention so concurrent runs do not attach activity to the wrong message.
+        """
+        if isinstance(metadata, dict):
+            for key in ("message_id", "reply_to_message_id", "thread_id", "telegram_reply_to_message_id"):
+                value = metadata.get(key)
+                if value:
+                    return str(value)
+        return self._last_mid.get(chat_id)
+
+    def _post_activity(self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Push the freshest tool-progress line into the activity box on the
         sender's message (processing-status) — blocking; call via executor."""
-        mid = self._last_mid.get(chat_id)
+        mid = self._message_id_from_metadata(chat_id, metadata)
         if not mid:
             return
         line = next((l.strip() for l in reversed(content.splitlines()) if l.strip()),
@@ -358,6 +468,36 @@ class AXAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def send_or_update_status(self, chat_id: str, status_key: str, content: str,
+                                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Route Hermes gateway status callbacks to the original message activity.
+
+        Without this method, gateway/run.py falls back to adapter.send(), which
+        posts context-pressure/approval/runtime status as ordinary aX messages.
+        aX wants these as processing-status updates on the triggering message.
+        """
+        mid = self._message_id_from_metadata(chat_id, metadata)
+        if not mid:
+            logger.info("aX: suppressed gateway status without inbound message id: %s", status_key)
+            return SendResult(success=True, message_id="status")
+        line = next((l.strip() for l in reversed(str(content or "").splitlines()) if l.strip()),
+                    str(content or "").strip())
+        if not line:
+            return SendResult(success=True, message_id="status")
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: ax.post_processing_status(
+                    mid,
+                    "working",
+                    line[:200],
+                    detail={"status_key": str(status_key), "signal_kind": "gateway_status"},
+                ),
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        return SendResult(success=True, message_id="status")
+
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -366,7 +506,7 @@ class AXAdapter(BasePlatformAdapter):
         # This covers headless/wrapped responders whose only way to signal "do
         # not answer" is a final token such as "NO_REPLY" / "no-reply".
         if self._is_no_reply_output_sentinel(content):
-            mid = self._last_mid.get(chat_id)
+            mid = self._message_id_from_metadata(chat_id, metadata)
             if mid:
                 await loop.run_in_executor(None, self._mark_no_reply, {"id": mid})
             else:
@@ -375,7 +515,7 @@ class AXAdapter(BasePlatformAdapter):
         # Tool-progress → activity box on the user's message (not a chat message).
         # Only the agent's final reply is posted as an actual aX message.
         if self._looks_like_progress(content):
-            await loop.run_in_executor(None, self._post_activity, chat_id, content)
+            await loop.run_in_executor(None, self._post_activity, chat_id, content, metadata)
             return SendResult(success=True, message_id="activity")
         try:
             mid = await loop.run_in_executor(
@@ -410,11 +550,98 @@ class AXAdapter(BasePlatformAdapter):
         lives in the channel and the tools show up in the message's activity box.
         """
         await asyncio.get_running_loop().run_in_executor(
-            None, self._post_activity, chat_id, content)
+            None, self._post_activity, chat_id, content, metadata)
         return SendResult(success=True, message_id=message_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group", "chat_id": chat_id}
+
+    # ── Media / attachments ──────────────────────────────────────────────────────
+    # Verified contract (peach, 2026-05-30): POST /api/v1/uploads/ (multipart `file`,
+    # space_id optional) -> {id, attachment_id, file_id, url, content_type, ...};
+    # then POST a message with attachments=[<that full upload dict>] (NOT the id
+    # string — that 422s) → lands in metadata.attachments and renders inline.
+    def _ax_upload(self, path: str, content_type: str, filename: Optional[str] = None) -> Optional[dict]:
+        """Blocking multipart upload to /api/v1/uploads/. Returns the upload dict."""
+        import json as _json
+        import urllib.request
+        import uuid
+        fn = filename or os.path.basename(path)
+        boundary = "----ax" + uuid.uuid4().hex
+        with open(path, "rb") as f:
+            data = f.read()
+        body = (
+            f"--{boundary}\r\n".encode()
+            + f'Content-Disposition: form-data; name="file"; filename="{fn}"\r\n'.encode()
+            + f"Content-Type: {content_type}\r\n\r\n".encode()
+            + data + b"\r\n"
+            + f"--{boundary}--\r\n".encode()
+        )
+        req = urllib.request.Request(
+            ax.BASE + "/api/v1/uploads/", data=body, method="POST",
+            headers={"Authorization": "Bearer " + ax.current_access_token(),
+                     "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return _json.load(r)
+
+    def _ax_post_attachment(self, chat_id, content, up, reply_to):
+        """Blocking: post a message carrying the uploaded file as an attachment."""
+        import json as _json
+        import urllib.request
+        # aX rejects empty/whitespace content even when an attachment is present
+        # (400 "Message content cannot be empty"). The gateway calls send_voice
+        # with no caption, so default to the file name as the content.
+        text = (content or "").strip()
+        if not text:
+            text = (isinstance(up, dict) and (up.get("original_filename") or up.get("filename"))) or "📎 attachment"
+        payload = {"content": text, "space_id": chat_id, "channel": "main",
+                   "message_type": "text", "attachments": [up]}
+        if reply_to:
+            payload["parent_id"] = reply_to
+        req = urllib.request.Request(
+            ax.MESSAGES_URL, data=_json.dumps(payload).encode(), method="POST",
+            headers={"Authorization": "Bearer " + ax.current_access_token(),
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = _json.load(r)
+        return (d.get("message") or d).get("id")
+
+    async def _send_file(self, chat_id, path, content_type, caption, reply_to, filename=None) -> SendResult:
+        """Upload a local file and post it as a message attachment. Falls back to a
+        text message (path/URL in content) if it's not a readable local file."""
+        loop = asyncio.get_running_loop()
+        if not (path and os.path.isfile(os.path.expanduser(path))):
+            # Not a local file (e.g. an http image_url) — degrade to a text post.
+            return await self.send(chat_id, (caption or "") + (f"\n{path}" if path else ""), reply_to)
+        p = os.path.expanduser(path)
+        try:
+            up = await loop.run_in_executor(None, self._ax_upload, p, content_type, filename)
+            if not up:
+                return SendResult(success=False, error="aX upload failed", retryable=True)
+            mid = await loop.run_in_executor(None, self._ax_post_attachment, chat_id, caption, up, reply_to)
+            return SendResult(success=bool(mid), message_id=str(mid) if mid else None, retryable=not mid)
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    @staticmethod
+    def _guess_mime(path: str, default: str) -> str:
+        import mimetypes
+        return mimetypes.guess_type(path)[0] or default
+
+    async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, audio_path, self._guess_mime(audio_path, "audio/mpeg"), caption, reply_to)
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, image_url, self._guess_mime(image_url, "image/png"), caption, reply_to)
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, image_path, self._guess_mime(image_path, "image/png"), caption, reply_to)
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, file_path, self._guess_mime(file_path, "application/octet-stream"), caption, reply_to, filename=file_name)
+
+    async def send_video(self, chat_id, video_path, caption=None, reply_to=None, metadata=None) -> SendResult:
+        return await self._send_file(chat_id, video_path, self._guess_mime(video_path, "video/mp4"), caption, reply_to)
 
 
 # ── Plugin registration ──────────────────────────────────────────────────────────
@@ -449,12 +676,55 @@ def _env_enablement() -> Optional[dict]:
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None,
                            media_files=None, force_document=False):
     """Out-of-process cron delivery (deliver=ax) when cron runs separately from
-    the gateway. Reuses the listener's post primitive directly."""
+    the gateway.
+
+    Mirrors the live gateway adapter's media contract: upload each local file,
+    then create a message with ``attachments=[<full upload dict>]``. This keeps
+    cron/send_message delivery from degrading ``MEDIA:/path`` outputs into plain
+    text on aX.
+    """
+    media_files = media_files or []
     try:
-        mid = ax.post_message(message, parent_id=thread_id, space_id=chat_id)
-        if mid:
-            return {"success": True, "message_id": str(mid)}
-        return {"error": "aX standalone send: post failed"}
+        # No media: keep the simple text path.
+        if not media_files:
+            mid = ax.post_message(message, parent_id=thread_id, space_id=chat_id)
+            if mid:
+                return {"success": True, "message_id": str(mid)}
+            return {"error": "aX standalone send: post failed"}
+
+        sent_ids = []
+        remaining_caption = message or ""
+        for media in media_files:
+            media_path = media[0] if isinstance(media, (list, tuple)) else str(media)
+            if not (media_path and os.path.isfile(os.path.expanduser(media_path))):
+                continue
+            path = os.path.expanduser(media_path)
+            content_type = AXAdapter._guess_mime(path, "application/octet-stream")
+            # _ax_upload/_ax_post_attachment do not depend on instance state;
+            # call the proven helper implementations without constructing the
+            # live gateway adapter (Platform("ax") may not exist in standalone
+            # plugin import contexts until registration finishes).
+            up = AXAdapter._ax_upload(None, path, content_type)
+            if not up:
+                continue
+            mid = AXAdapter._ax_post_attachment(None, chat_id, remaining_caption, up, thread_id)
+            if mid:
+                sent_ids.append(str(mid))
+                # Only the first attachment carries the text/caption.
+                remaining_caption = ""
+
+        if sent_ids:
+            return {"success": True, "message_id": sent_ids[-1], "message_ids": sent_ids}
+
+        # Media was requested but nothing attached. Fall back to text if present,
+        # but report the attachment failure so callers do not mistake it for a
+        # native media delivery.
+        if message:
+            mid = ax.post_message(message, parent_id=thread_id, space_id=chat_id)
+            if mid:
+                return {"success": False, "message_id": str(mid),
+                        "error": "aX standalone media upload failed; text fallback posted"}
+        return {"error": "aX standalone send: no media files attached"}
     except Exception as e:
         return {"error": f"aX standalone send failed: {e}"}
 
@@ -478,7 +748,9 @@ def register(ctx):
         emoji="🛰️",
         platform_hint=(
             "You are posting to aX, an agent activity stream. Markdown renders. "
-            "Address other agents with @handle. Keep chat messages short and put "
-            "substance in context artifacts. Replies thread under the message you answer."
+            "Avoid gratuitous @mentions in routine peer-agent replies; only use "
+            "@handle when you intentionally need to wake a specific agent. Keep "
+            "chat messages short and put substance in context artifacts. Replies "
+            "thread under the message you answer."
         ),
     )
