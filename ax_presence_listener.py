@@ -46,15 +46,16 @@ HOME_FEED_FILE = os.path.expanduser(
     os.environ.get("AX_HOME_FEED_FILE", f"~/.ax/{AGENT_HANDLE}-home-feed.json"))  # rolling cross-space SSE activity
 BUSY_MESSAGES_FILE = os.path.expanduser(
     os.environ.get("AX_BUSY_MESSAGES_FILE", f"~/.ax/{AGENT_HANDLE}-busy-messages.json"))  # customizable check-in lines
-# Fun, customizable "still working" check-in lines the waiting party sees while this
-# agent works. Edit BUSY_MESSAGES_FILE (a JSON list) to personalize; these are defaults.
+# Neutral, customizable "still working" check-in lines the waiting party sees while
+# this agent works. Edit BUSY_MESSAGES_FILE (a JSON list) to personalize; these are
+# safe OSS-facing defaults.
 DEFAULT_BUSY = [
-    "still on it — hang tight 🛠️",
-    "deep in this one, give me a sec",
-    "grinding through it ⚙️",
-    "🖕 busy busy — almost there 😅",
-    "thinking hard, don't go anywhere",
-    "cooking… 🍳",
+    "still on it — checking the next step",
+    "working through the request",
+    "validating the result",
+    "checking context and tool output",
+    "running the next verification step",
+    "almost done — confirming details",
 ]
 
 BASE         = os.environ.get("AX_BASE", "https://paxai.app")
@@ -98,14 +99,32 @@ def alert(text):
         print(f"[listener] alert POST failed (in-session wake still fired): {e!r}", file=sys.stderr, flush=True)
 
 
-def post_processing_status(mid, status, activity=None):
+def build_processing_body(mid, status, activity=None, tool_name=None, progress=None, detail=None):
+    """Build the processing-status body from safe, UI-facing fields only."""
+    body = {"message_id": mid, "status": status, "agent_name": AGENT_HANDLE}
+    if activity:
+        body["activity"] = activity
+    if tool_name:
+        body["tool_name"] = str(tool_name)
+    if progress is not None:
+        try:
+            cur = int(progress.get("current"))
+            tot = int(progress.get("total"))
+            unit = progress.get("unit")
+            body["progress"] = {"current": cur, "total": tot, "unit": str(unit) if unit else "steps"}
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if isinstance(detail, dict) and detail:
+        body["detail"] = detail
+    return body
+
+
+def post_processing_status(mid, status, activity=None, tool_name=None, progress=None, detail=None):
     """Publish an agent_processing event so the SENDER's progress bar shows
     receipt/progress (no black hole). Best-effort — never blocks the wake."""
     try:
         at = load_tok().get("access_token")
-        body = {"message_id": mid, "status": status, "agent_name": AGENT_HANDLE}
-        if activity:
-            body["activity"] = activity
+        body = build_processing_body(mid, status, activity, tool_name, progress, detail)
         urllib.request.urlopen(urllib.request.Request(PROCESSING_URL, data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
                      "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID}), timeout=10)
