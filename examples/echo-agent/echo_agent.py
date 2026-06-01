@@ -23,7 +23,7 @@ Run:
     export AX_SPACE_ID=<your-space-uuid>
     python3 echo_agent.py                  # device-code on first run, then echoes
 """
-import os, sys, json, time, threading, urllib.request, urllib.parse, urllib.error
+import os, sys, json, time, threading, re, urllib.request, urllib.parse, urllib.error
 
 # Make the repo-root + this dir importable no matter where we're launched from.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,7 +45,18 @@ _agent_id_cache = None
 
 
 def _access_token():
-    return ax.load_tok().get("access_token")
+    """Return a valid access token, refreshing before expiry when possible.
+
+    The first Atlas outage showed why this cannot just read the file: the SSE
+    stream can stay open past token expiry while heartbeat/status/reply calls
+    start returning 401, making the agent look present-but-mute. Reuse the
+    proven ax_presence_listener refresh path for every non-SSE API call.
+    """
+    try:
+        return ax.current_access_token()
+    except Exception as e:
+        print(f"[echo] token refresh/read failed; falling back to stored token: {e!r}", flush=True)
+        return ax.load_tok().get("access_token")
 
 
 def _agent_id():
@@ -88,6 +99,47 @@ def _auth_headers(extra=None):
     return h
 
 
+_HANDLE_RE = r"@[-A-Za-z0-9_]+"
+_NO_REPLY_RE = re.compile(
+    rf"^\s*(?:{_HANDLE_RE}[\s,:;\-—–]+)*no[\s-]+reply(?:[\s,:;\-—–]+{_HANDLE_RE})*\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_NO_REPLY_OUTPUT_RE = re.compile(
+    r"^\s*(?:no[\s_-]?reply|NO_REPLY)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_no_reply_safe_word(content):
+    """Exact safe-word command: only 'no reply'/'no-reply', allowing surrounding @handles/punctuation."""
+    return bool(_NO_REPLY_RE.search(str(content or "")))
+
+
+def _is_no_reply_output_sentinel(content):
+    """Responder abstention token: suppress chat delivery and post no_reply status."""
+    return bool(_NO_REPLY_OUTPUT_RE.search(str(content or "")))
+
+
+def _mark_no_reply(mid):
+    """Close a mention visibly without waking/responding: emit skipped/no_reply status."""
+    if not mid:
+        return
+    ax.post_processing_status(
+        mid,
+        "skipped",
+        activity="no reply",
+        detail={
+            "reason": "no reply",
+            "label": "no reply",
+            "reason_code": "no_reply",
+            "signal_kind": "no_reply",
+            "safe_word": "no reply/no-reply",
+            "signal_only": True,
+            "emoji": "",
+        },
+    )
+
+
 def heartbeat_loop():
     """Publish platform presence so the agent shows online/responsive — THE proof of
     'connected'. Server TTL ~30s, so beat ~20s. Best-effort; never crashes the agent."""
@@ -104,6 +156,15 @@ def heartbeat_loop():
             if first:
                 print(f"[echo] heartbeat live (agent_id={aid[:8]}…) — registering online", flush=True)
                 first = False
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print("[echo] heartbeat got 401 — refreshing token", flush=True)
+                try:
+                    ax.refresh()
+                except Exception as ex:
+                    print(f"[echo] heartbeat refresh failed: {ex!r}", flush=True)
+            else:
+                print(f"[echo] heartbeat failed (will retry): {e!r}", flush=True)
         except Exception as e:
             print(f"[echo] heartbeat failed (will retry): {e!r}", flush=True)
         time.sleep(20)
@@ -134,6 +195,14 @@ class AxMentionSource:
                             continue
                         if ax.mentions_me(d) and not _is_self(d):
                             content = (d.get("content") or "").strip()
+                            if _is_no_reply_safe_word(content):
+                                try:
+                                    _mark_no_reply(d.get("id"))
+                                    print(f"[echo] no-reply safe-word status posted (msg={d.get('id')})", flush=True)
+                                except Exception as e:
+                                    print(f"[echo] no-reply safe-word status failed: {e!r}", flush=True)
+                                event = None
+                                continue
                             who = (d.get("username") or d.get("display_name")
                                    or d.get("agent_name") or d.get("sender_name") or "someone")
                             yield mc.Event(
@@ -176,7 +245,7 @@ def _post_reply(mid, space_id, text):
         print(f"[echo] reply failed: {e!r}", flush=True)
 
 
-NO_REPLY = "NO_REPLY"   # responder sentinel: abstain — post processing-status no_reply, send nothing
+NO_REPLY = "NO_REPLY"   # responder sentinel: abstain — post processing-status skipped/no_reply, send nothing
 
 
 def _status(mid, status, activity=None):
@@ -204,8 +273,8 @@ def echo_reply(event):
             _status(mid, "working", f"{RESPONDER_NAME} composing a reply")
             answer = RESPONDER(content, who)             # echo string | claude -p | codex | hermes
             ans = (answer or "").strip()
-            if not ans or ans == NO_REPLY:               # abstain → no_reply, no message
-                _status(mid, "no_reply", "intentionally not replying")
+            if not ans or _is_no_reply_output_sentinel(ans):  # abstain → skipped/no_reply, no message
+                _mark_no_reply(mid)
                 print(f"[{RESPONDER_NAME}] no_reply (abstained) for {mid}", flush=True)
                 return
             text = f"@{who} ⏰ {DELAY}s — {ans}" if DELAY > 0 else ans
@@ -236,7 +305,10 @@ def main():
     aid = _agent_id()
     if aid:
         ax.AGENT_ID = aid
-    # Step 2: heartbeat so the platform shows us connected/online.
+    # Step 2: proactively refresh token + heartbeat so the platform shows us connected/online.
+    # The SSE stream can survive beyond access-token expiry, but heartbeat/status/reply API
+    # calls cannot. The proactive refresh thread prevents present-but-mute failures.
+    threading.Thread(target=ax.proactive_refresh_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     # Step 3: echo loop on the shared monitor core (dedup + target-match for free).
     print(f"[echo] @{ax.AGENT_HANDLE} is live. Mention it and it echoes back. Ctrl-C to stop.", flush=True)

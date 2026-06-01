@@ -29,7 +29,17 @@
 #   * Pin AX_AGENT_ID after first connect (avoids the auto-resolve/token-refresh race).
 set -euo pipefail
 
-HANDLE="${1:?usage: standup-agent.sh <handle> [hermes|claude|echo] [space_id]}"
+HANDLE="${1:?usage: standup-agent.sh <handle> [hermes|claude|echo] [space_id] OR standup-agent.sh <handle> <destination-space-id>}"
+
+# Compatibility path for the move/onboarding shorthand requested by the lane:
+# `standup-agent.sh <handle> <destination-space-id>` means restart the gateway
+# listener in that space and verify destination SSE/presence. The legacy create
+# path remains `standup-agent.sh <handle> [hermes|claude|echo] [space_id]`.
+if [[ "${2:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+  REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  exec "$REPO/scripts/agent-move-and-verify.sh" "$HANDLE" "$2" "${@:3}"
+fi
+
 TARGET="${2:-hermes}"
 SPACE_ID="${3:-${AX_SPACE_ID:-}}"
 AGENTS_ROOT="${AGENTS_ROOT:-/home/ax-agents/agents}"
@@ -87,6 +97,7 @@ export AX_SPACE_ID=$SPACE_ID
 export AX_TOKEN_FILE="\$HOME/.ax/$HANDLE-listener.json"
 export AX_SPONSOR=$SPONSOR
 export AX_RESPONDER=$TARGET
+export AX_CLAUDE_DIR="$HOME_DIR/claude-workdir"
 export HERMES_CMD="hermes -c -z"
 export HERMES_HOME=$HOME_DIR
 export PYTHONUNBUFFERED=1

@@ -38,6 +38,8 @@ TOKEN_FILE   = os.path.expanduser(
     os.environ.get("AX_TOKEN_FILE", f"~/.ax/{AGENT_HANDLE}-listener.json"))
 ACTIVITY_FILE = os.path.expanduser(
     os.environ.get("AX_ACTIVITY_FILE", f"~/.ax/{AGENT_HANDLE}-activity"))  # agent writes activity here
+ACTIVITY_JSON_FILE = os.path.expanduser(
+    os.environ.get("AX_ACTIVITY_JSON_FILE", f"~/.ax/{AGENT_HANDLE}-activity.json"))  # structured {line,tool,step,total,unit}
 REMINDERS_FILE = os.path.expanduser(
     os.environ.get("AX_REMINDERS_FILE", f"~/.ax/{AGENT_HANDLE}-reminders.json"))  # self-scheduled wakes
 HEARTBEAT_FILE = os.path.expanduser(
@@ -46,16 +48,16 @@ HOME_FEED_FILE = os.path.expanduser(
     os.environ.get("AX_HOME_FEED_FILE", f"~/.ax/{AGENT_HANDLE}-home-feed.json"))  # rolling cross-space SSE activity
 BUSY_MESSAGES_FILE = os.path.expanduser(
     os.environ.get("AX_BUSY_MESSAGES_FILE", f"~/.ax/{AGENT_HANDLE}-busy-messages.json"))  # customizable check-in lines
-# Neutral, customizable "still working" check-in lines the waiting party sees while
-# this agent works. Edit BUSY_MESSAGES_FILE (a JSON list) to personalize; these are
-# safe OSS-facing defaults.
+# OSS-safe, customizable "still working" check-in lines the waiting party sees
+# while this agent works. Edit BUSY_MESSAGES_FILE (a JSON list) to personalize;
+# these defaults should stay neutral, professional, and useful.
 DEFAULT_BUSY = [
-    "still on it — checking the next step",
-    "working through the request",
-    "validating the result",
-    "checking context and tool output",
-    "running the next verification step",
-    "almost done — confirming details",
+    "Still working — checking the details…",
+    "Using tools to make progress…",
+    "Reviewing context and current state…",
+    "Running the next verification step…",
+    "Preparing a concise update…",
+    "Almost there — validating the result…",
 ]
 
 BASE         = os.environ.get("AX_BASE", "https://paxai.app")
@@ -100,7 +102,9 @@ def alert(text):
 
 
 def build_processing_body(mid, status, activity=None, tool_name=None, progress=None, detail=None):
-    """Build the processing-status body from safe, UI-facing fields only."""
+    """Build the processing-status body. Keep legacy status/activity behavior,
+    but forward safe structured fields when available so Hermes agents can show
+    tool/category + concise progress without leaking raw args or output."""
     body = {"message_id": mid, "status": status, "agent_name": AGENT_HANDLE}
     if activity:
         body["activity"] = activity
@@ -132,6 +136,40 @@ def post_processing_status(mid, status, activity=None, tool_name=None, progress=
         print(f"[listener] processing-status post failed: {e!r}", file=sys.stderr, flush=True)
 
 
+def _extract_message_list(data):
+    if isinstance(data, dict):
+        return data.get("messages") or data.get("items") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _recover_posted_message_id(at, content, space_id, parent_id=None):
+    """Recover a POSTed message id when the deployed API returns an empty body.
+
+    Some aX message POST paths successfully create the message but return HTTP 2xx
+    with no JSON body. Treat that as an ambiguous send, not a failure: fetch recent
+    destination-space messages and locate the exact content/parent pair.
+    """
+    try:
+        qs = urllib.parse.urlencode({"space_id": space_id, "limit": 50})
+        req = urllib.request.Request(f"{MESSAGES_URL}?{qs}",
+            headers={"Authorization": "Bearer " + at,
+                     "X-Agent-Id": AGENT_ID, "X-Space-Id": space_id})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except Exception as e:
+        print(f"[send] recovery list failed: {e!r}", flush=True)
+        return None
+    for m in _extract_message_list(data):
+        if (m.get("content") or "") != content:
+            continue
+        if parent_id and m.get("parent_id") != parent_id:
+            continue
+        return (m.get("message") or m).get("id")
+    return None
+
+
 def post_message(content, parent_id=None, space_id=None):
     """The easy 'respond to a side question / give an update' primitive.
 
@@ -140,16 +178,25 @@ def post_message(content, parent_id=None, space_id=None):
     new message id (or None). Drives the --reply / --say one-shots so an agent can
     answer a mention in one line instead of hand-rolling a REST call."""
     at = load_tok().get("access_token")
-    payload = {"content": content, "space_id": space_id or SPACE_ID,
+    target_space = space_id or SPACE_ID
+    payload = {"content": content, "space_id": target_space,
                "channel": "main", "message_type": "text"}
     if parent_id:
         payload["parent_id"] = parent_id
     try:
         req = urllib.request.Request(MESSAGES_URL, data=json.dumps(payload).encode(), method="POST",
-            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"})
+            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
+                     "X-Agent-Id": AGENT_ID, "X-Space-Id": target_space})
         with urllib.request.urlopen(req, timeout=20) as r:
-            d = json.load(r)
-        mid = (d.get("message") or d).get("id")
+            raw = r.read()
+        if raw:
+            d = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            mid = (d.get("message") or d).get("id")
+        else:
+            mid = _recover_posted_message_id(at, content, target_space, parent_id)
+        if not mid:
+            print("[send] failed: POST returned no readable message id", flush=True)
+            return None
         globals()["_replies_sent"] += 1               # productivity signal
         globals()["_last_reply_at"] = int(time.time())
         globals()["_currently_401"] = False           # a landed post proves auth works
@@ -157,8 +204,10 @@ def post_message(content, parent_id=None, space_id=None):
         print(f"[send] failed: {e!r}", flush=True)
         return None
     try:                                  # verify it landed; never trust the 2xx alone
-        vr = urllib.request.Request(f"{MESSAGES_URL}/{mid}", headers={"Authorization": "Bearer " + at})
-        urllib.request.urlopen(vr, timeout=15)
+        req = urllib.request.Request(f"{MESSAGES_URL}/{mid}",
+            headers={"Authorization": "Bearer " + at,
+                     "X-Agent-Id": AGENT_ID, "X-Space-Id": target_space})
+        urllib.request.urlopen(req, timeout=15)
         print(f"[send] delivered (id={mid})", flush=True)
     except Exception:
         print(f"[send] posted (id={mid}) but re-fetch failed — verify in app", flush=True)
@@ -173,6 +222,65 @@ def _fmt_elapsed(secs):
     if secs < 3600:
         return f"{secs // 60}m{secs % 60:02d}s"
     return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def parse_activity(json_text=None, legacy_text=None):
+    """Parse structured Hermes activity ({line,tool,step,total,unit}) with a
+    legacy string fallback. This intentionally exposes only concise labels/progress,
+    not raw command arguments, environment, tokens, or tool output."""
+    if json_text:
+        try:
+            d = json.loads(json_text)
+            if isinstance(d, dict):
+                out: dict[str, object] = {"line": str(d.get("line") or "").strip()}
+                if d.get("tool"):
+                    out["tool"] = str(d["tool"])
+                step, total = d.get("step"), d.get("total")
+                if isinstance(step, str) and "/" in step:
+                    a, _, b = step.partition("/")
+                    step, total = a, b
+                if step is not None:
+                    try:
+                        out["step"] = int(step)
+                    except (TypeError, ValueError):
+                        pass
+                if total is not None:
+                    try:
+                        out["total"] = int(total)
+                    except (TypeError, ValueError):
+                        pass
+                if d.get("unit"):
+                    out["unit"] = str(d["unit"])
+                return out
+        except Exception:
+            pass
+    return {"line": (legacy_text or json_text or "").strip()}
+
+
+def read_activity():
+    """Read current activity, preferring structured JSON and falling back to the
+    legacy bare-string file for Claude Code/Codex/older agent compatibility."""
+    jt = lt = None
+    try:
+        jt = open(ACTIVITY_JSON_FILE).read()
+    except Exception:
+        jt = None
+    if not jt:
+        try:
+            lt = open(ACTIVITY_FILE).read()
+        except Exception:
+            lt = None
+    return parse_activity(jt, lt)
+
+
+def activity_to_progress(act):
+    """Turn parsed step/total activity into the backend progress shape."""
+    if act.get("step") is not None and act.get("total") is not None:
+        p = {"current": act["step"], "total": act["total"]}
+        if act.get("unit"):
+            p["unit"] = act["unit"]
+        return p
+    return None
 
 
 def load_busy_messages():
@@ -191,23 +299,24 @@ def keeper(mid, stop):
     """Keep the requester's check-in / progress bar ALIVE while this agent works on
     `mid`: re-post 'working' every ~25s until the reply lands (stop set, by the stream
     loop) or a safety cap, then 'completed'. The status carries (a) HOW LONG the agent
-    has been working (elapsed), and (b) either the real activity (agent writes
-    ACTIVITY_FILE) or a rotating fun, customizable 'still working' line. This is the
-    agent-to-agent check-in: the waiting party sees a live spinner + 'still on it',
-    not a black hole. A response is what closes the message."""
+    has been working (elapsed), and (b) either real activity (Hermes/tool progress
+    when available) or a rotating neutral, customizable 'still working' line. This is
+    the agent-to-agent check-in: the waiting party sees useful progress, not a black
+    hole. A response is what closes the message."""
     start = time.time()
     deadline = start + 900  # 15 min safety cap
     busy = load_busy_messages()
     i = 0
     while not stop.is_set() and time.time() < deadline:
-        try:
-            act = open(ACTIVITY_FILE).read().strip()
-        except Exception:
-            act = ""
-        if not act:                       # no real activity reported -> rotate a fun check-in
+        parsed = read_activity()          # structured JSON preferred, legacy string fallback
+        act = parsed.get("line")
+        tool = parsed.get("tool")
+        progress = activity_to_progress(parsed)
+        if not act:                       # no real activity reported -> rotate a neutral check-in
             act = busy[i % len(busy)]
             i += 1
-        post_processing_status(mid, "working", f"{act} (⏱ {_fmt_elapsed(time.time() - start)})")
+        post_processing_status(mid, "working", f"{act} (⏱ {_fmt_elapsed(time.time() - start)})",
+                               tool_name=tool, progress=progress)
         stop.wait(25)
     total = _fmt_elapsed(time.time() - start)
     post_processing_status(mid, "completed",

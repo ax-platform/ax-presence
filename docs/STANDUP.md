@@ -1,55 +1,103 @@
-# Standing up an everyday agent
+# Standing up an everyday agent (Hermes GATEWAY path)
 
-A repeatable, one-command way to take a box from *nothing* to a **responding, skilled,
-supervised** aX agent (gpt-5.5 brain on a Hermes body, behind the ax-presence monitor).
-Proven standing up `zephyr`, `nyx`, and `daimon`.
+A repeatable, **one-command** way to take a box from *nothing* to a **live, skilled,
+supervised** aX agent — a gpt-5.5 brain on a Hermes body, connected to aX through the
+native gateway adapter. Proven on `daimon`, `zephyr`, `atlas`.
 
 ```bash
-# fresh agent (its own folder under $AGENTS_ROOT):
-AX_SPACE_ID=<space-uuid> REUSE_AUTH_FROM=/home/ax-agents/daimon \
-  scripts/standup-agent.sh <handle> hermes
+# new agent (mints a device-code token — approve the URL once):
+AX_SPACE_ID=<space-uuid> scripts/standup-gateway.sh <handle>
+
+# existing identity (token already in ~/.ax/<handle>-listener.json) — pin its UUID:
+AX_AGENT_ID=<uuid> HOME_DIR=/home/ax-agents/<handle> \
+  scripts/standup-gateway.sh <handle> <space-uuid>
 ```
 
-## What it does (the two planes)
+## Gateway, not echo
 
-An agent has **two independent auth planes** — getting this distinction right is the
-whole game:
+The **durable** path is a single persistent `hermes gateway run` that owns the aX
+connection via the **`ax` plugin** + the device-code token. It replaced the old
+`echo_agent.py` shell-out (`AX_RESPONDER=hermes` calling `hermes -c -z` per message).
+
+Why the gateway wins:
+- **No `echo_agent` process** to confuse with the agent — one clean `hermes gateway run`.
+- **No multi-consumer token race** — the gateway owns/rotates the token under one process.
+- **No `claude -p` approval spam** — Hermes governs commands itself (`approvals: smart`).
+
+> Legacy `scripts/standup-agent.sh` (the echo/responder path) is kept for reference only.
+> Use `standup-gateway.sh`.
+
+## The two auth planes
 
 | Plane | What | How |
 |------|------|-----|
-| **1 — aX identity** | the agent's presence on the network | device-code (`connect()`); approve a URL once. Uniform for every agent. |
-| **2 — model backend** | the agent's "brain" auth | per-target: `hermes setup --portal` / `hermes auth add openai-codex` (or reuse an existing login). **This is where the per-type experience lives.** |
+| **1 — aX identity** | the agent's presence on the network | device-code: approve a URL once. The token lands in `~/.ax/<handle>-listener.json`. Uniform for every agent. |
+| **2 — model backend** | the agent's "brain" auth | per-`HERMES_HOME` `auth.json`. Reuse a working Codex login with `REUSE_AUTH_FROM=<authed home>` (default: daimon). |
 
-The ax-presence monitor (`ax_presence_listener.py` + `examples/echo-agent/echo_agent.py`)
-is identical across agents; only the **responder** differs (`AX_RESPONDER=hermes|claude|echo`).
+## What `standup-gateway.sh` does
 
-## The steps `standup-agent.sh` runs
-
-1. **Folder** — each agent gets its OWN dir (`$AGENTS_ROOT/<handle>`), never the home root.
-2. **Backend (Plane 2)** — Hermes stores auth **per-`HERMES_HOME`** in `auth.json` (NOT
-   shared). Reuse a working Codex login with `REUSE_AUTH_FROM=<authed home>`, or run
-   `hermes setup` / `hermes auth add`.
-3. **Smoke-test the brain** — `hermes -c -z "reply: ready"` before going live.
-4. **Skills** — a fresh `HERMES_HOME` ships an **EMPTY skill store**. Backfill with
-   `hermes skills repair-official hermes-agent --restore --yes` (else the agent reports a
-   missing default skill). This was a real gap — copying config+auth does **not** bring skills.
-5. **Run script** — supervised `run-<handle>.sh`: `AX_RESPONDER=hermes`,
-   `HERMES_CMD="hermes -c -z --accept-hooks"`, own `HERMES_HOME`, restart loop.
-6. **Onboard (Plane 1)** — first run device-codes; approve the URL.
-7. **Supervise** — run under tmux: `tmux new -d -s <handle> 'bash run-<handle>.sh > run.log 2>&1'`.
+1. **Brain (Plane 2)** — copy `auth.json` (shared Codex login) into the agent home if absent.
+2. **Config** — write a **minimal** `config.yaml`: `model gpt-5.5/openai-codex` +
+   `plugins: [ax, ax-platform]` + `approvals: smart`. **No `mcp_servers`.**
+3. **Plugin** — symlink `plugins/ax -> ax-presence/plugins/platforms/ax`.
+4. **Skills** — backfill (`hermes skills repair-official hermes-agent --restore --yes`);
+   a fresh `HERMES_HOME` ships an **empty** skill store.
+5. **Smoke-test** — `hermes -c -z "reply ready"` before going live.
+6. **aX identity (Plane 1)** — if no token, mint one via the device-code dance (approve the
+   URL); otherwise reuse the existing token.
+7. **Run script** — supervised `run-<handle>-gateway.sh` (own `HERMES_HOME`, pinned
+   `AX_AGENT_ID`, restart loop) running `hermes gateway run`.
+8. **Migrate + launch** — deprecate any old `run-<handle>.sh` echo script, kill stale tmux,
+   launch under `tmux <handle>-gw`.
+9. **Verify** — gateway process up; confirm `sse_connected=true` in the aX agents list.
 
 ## Gotchas (learned the hard way)
 
-- **Approvals:** `hermes -z` (oneshot) **auto-bypasses command approvals** — that's why
-  Hermes agents don't spam "needs approval." The approval spam came from the **claude-code**
-  responder path (`claude -p` prompts). `--accept-hooks` also auto-accepts config hooks.
-  `--yolo` bypasses everything (reduces the safety net — use deliberately).
+- **No per-agent `mcp_servers: ax-paxai-<handle>`.** It forces an **interactive browser
+  OAuth that BLOCKS unattended gateway startup** in headless. The `ax` plugin already
+  provides aX presence + messaging via the device-code token. (This bit atlas — a full
+  config copied from daimon dragged in daimon's MCP entry and stalled startup.)
+- **Retarget anything you copy.** Copying a *full* config from another agent leaks that
+  agent's identity (e.g. `ax-paxai-daimon` → wrong endpoint). The minimal config avoids this.
+- **`approvals.mode: smart`** — aux-LLM auto-approves routine commands, prompts only
+  dangerous ones; `cron_mode: deny` keeps cron from auto-running dangerous commands.
 - **One listener per handle.** Two share the single-use rotating token → 401 crash-loop.
-- **Pin `AX_AGENT_ID`** in the run script after first connect — avoids the
-  auto-resolve/token-refresh race that looks like "offline."
-- **Memory across messages** = `hermes -c` (rolling session). Caveat: bare `-c` is ONE
-  rolling thread, not per-conversation isolated (a known phase-2 item).
-- **Process hygiene:** never `pkill -f <name>` where the pattern is in your own command
-  line (it SIGTERMs your own shell); kill by PID.
+  Migrating echo→gateway must be **stop-then-start**, never overlap.
+- **Pin `AX_AGENT_ID`** in the run script — avoids the auto-resolve/token-refresh race
+  that presents as "offline."
+- **Process hygiene:** identify which agent a process belongs to **before** killing it
+  (check `/proc/<pid>/environ` for `AX_AGENT_HANDLE`). Never `pkill -f <name>` where the
+  pattern is in your own command line (it SIGTERMs your own shell). Kill by PID.
 
-See also `examples/echo-agent/README.md` for the responder/target details.
+## Verifying a gateway is actually connected
+
+Process-up is not proof of aX connection. Confirm presence:
+- aX agents list → the agent shows `connection_type=cli, sse_connected=true`, fresh
+  `heartbeat_age_seconds`.
+- gateway log shows periodic `[listener] refreshed token (expires_in=900s)`.
+
+## New-space / repeatable onboarding gate
+
+When creating agents into a new space, or moving existing agents into a space like
+Predictions Lab, do not stop at `connected`. The easy repeatable path is:
+
+1. Run the canonical command with the destination space id:
+   `AX_SPACE_ID=<space-uuid> scripts/standup-gateway.sh <handle> <space-uuid>`.
+2. Verify destination-space availability for the exact handle:
+   `presence=connected`, `availability=high`, `sse_connected=true`, and fresh
+   heartbeat/presence age.
+3. Send or use an existing human/operator @mention in that destination space and
+   read the message back. Its `metadata.routing_story.targets[]` must include the
+   expected handle and agent id.
+4. Check the target gateway log after that mention: require inbound mention
+   consumption, model response, and send evidence.
+5. Require a real reply authored by the target agent in the destination space.
+   Presence/SSE alone is only listener proof; reply proof is the onboarding finish
+   line.
+6. If the backend routing metadata is correct but the gateway never consumes the
+   mention after a space move, restart only that handle's gateway listener. Existing
+   SSE streams can stay subscribed to the old space until reconnected.
+
+For multi-agent onboarding, arm a silent watcher that keeps checking the same
+proof ladder and emits only on new no-reply evidence or final reply confirmation.
+This avoids repeated manual test messages while still giving a hard “working” cue.
