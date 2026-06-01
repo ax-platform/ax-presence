@@ -23,9 +23,11 @@ _SYS = ("You are an aX network agent replying to a teammate's message over chat.
         "Reply concisely and directly — no preamble, no sign-off.")
 
 # Persistent Claude session: keep ONE conversation going across messages (continuity),
-# and run it from a working dir. Configure with AX_CLAUDE_DIR.
+# and run it from a working dir. Configure with AX_CLAUDE_DIR. Persist the session id
+# to disk so a supervisor restart keeps the same Claude Code conversation.
 _CLAUDE_DIR = os.path.expanduser(os.environ.get("AX_CLAUDE_DIR", "~/.ax/claude-agent-workdir"))
-_session = {"id": None}
+_SESSION_FILE = os.path.join(_CLAUDE_DIR, ".ax-claude-session-id")
+_session = {"id": ""}
 _session_lock = threading.Lock()
 
 
@@ -59,17 +61,33 @@ def echo(content, who):
 
 
 def claude(content, who):
-    """A Claude Code agent that KEEPS THE SESSION GOING across messages: the first
-    message starts a session (fixed --session-id), each later message --resumes it, all
-    run from AX_CLAUDE_DIR. So the agent remembers the conversation."""
+    """A Claude Code agent that KEEPS THE SESSION GOING across messages.
+
+    The first message starts a fixed --session-id, persisted under AX_CLAUDE_DIR;
+    later messages --resume it even after the ax-presence supervisor restarts.
+    Print mode (`-p`) is used for headless aX replies, and
+    --dangerously-skip-permissions provides auto-approval for Claude Code tool use.
+    """
     os.makedirs(_CLAUDE_DIR, exist_ok=True)
     with _session_lock:
-        if _session["id"] is None:                      # first message → new session
+        if not _session["id"]:
+            try:
+                with open(_SESSION_FILE, "r", encoding="utf-8") as f:
+                    saved = f.read().strip()
+                if saved:
+                    _session["id"] = saved
+            except FileNotFoundError:
+                pass
+        if not _session["id"]:                      # first message → new session
             _session["id"] = str(uuid.uuid4())
-            cmd = ["claude", "-p", "--session-id", _session["id"],
+            with open(_SESSION_FILE, "w", encoding="utf-8") as f:
+                f.write(_session["id"] + "\n")
+            cmd = ["claude", "-p", "--dangerously-skip-permissions",
+                   "--session-id", _session["id"],
                    "--append-system-prompt", _SYS, content]
         else:                                           # later messages → resume same session
-            cmd = ["claude", "-p", "--resume", _session["id"], content]
+            cmd = ["claude", "-p", "--dangerously-skip-permissions",
+                   "--resume", _session["id"], content]
     return _run(cmd, timeout=180, cwd=_CLAUDE_DIR, login=True)
 
 
