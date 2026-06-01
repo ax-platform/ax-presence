@@ -189,6 +189,13 @@ class AXAdapter(BasePlatformAdapter):
                             d = json.loads(line[5:].strip())
                         except Exception:
                             continue
+                        # Only handle mentions from the space this gateway was
+                        # launched for. The aX SSE stream can still deliver
+                        # mentions from spaces where the identity remains a
+                        # member; without this guard, a moved agent can answer in
+                        # its old/home space even while connected to a new space.
+                        if not self._event_space_matches(d):
+                            continue
                         # R3: never react to our own posts (echo-loop guard).
                         if d.get("agent_id") == self.agent_id:
                             continue
@@ -243,6 +250,28 @@ class AXAdapter(BasePlatformAdapter):
     def _is_no_reply_output_sentinel(cls, content: str) -> bool:
         """True when the agent's final output is exactly a no-reply sentinel."""
         return bool(cls._NO_REPLY_OUTPUT_RE.search(str(content or "")))
+
+    def _event_space_matches(self, d: dict) -> bool:
+        """True when an SSE mention belongs to this gateway's configured space.
+
+        Some aX streams can deliver mention events for any space where the agent
+        identity remains addressable. A moved gateway must not answer old/home
+        space mentions after it has been launched with a destination AX_SPACE_ID.
+        Missing space_id is allowed for backwards-compatible event shapes.
+        """
+        event_space = d.get("space_id")
+        if not event_space:
+            return True
+        expected = str(self.space_id or "")
+        if not expected:
+            return True
+        if str(event_space) == expected:
+            return True
+        logger.info(
+            "aX: ignored mention %s for space %s while connected to %s",
+            d.get("id"), event_space, expected,
+        )
+        return False
 
     def _mark_no_reply(self, d: dict) -> None:
         """Publish a visible no-reply status on the triggering message.
