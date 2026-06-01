@@ -191,6 +191,19 @@ class AXAdapterStatusRoutingTest(unittest.TestCase):
             post_message.assert_called_once()
         asyncio.run(run())
 
+    def test_event_space_guard_rejects_mentions_from_other_spaces(self):
+        self.adapter.space_id = "dest-space"
+        self.assertTrue(self.adapter._event_space_matches({"id": "msg-ok", "space_id": "dest-space"}))
+        self.assertFalse(self.adapter._event_space_matches({"id": "msg-old", "space_id": "home-space"}))
+
+    def test_event_space_guard_allows_legacy_events_without_space_id(self):
+        self.adapter.space_id = "dest-space"
+        self.assertTrue(self.adapter._event_space_matches({"id": "msg-legacy"}))
+
+    def test_event_space_guard_allows_events_when_adapter_has_no_configured_space(self):
+        self.adapter.space_id = ""
+        self.assertTrue(self.adapter._event_space_matches({"id": "msg-any", "space_id": "some-space"}))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
