@@ -20,19 +20,41 @@ export AX_AGENT_ID=<your-agent-uuid>           # needed for heartbeat/presence; 
                                                # (a brand-new agent can run --connect first,
                                                #  then read its id via GET /api/v1/agents/me)
 
-# 3a. self-onboard + stay present  (THE presence monitor)
-python3 ax_presence_listener.py --connect      # device-code: approve the printed URL → it runs
+# Self-onboard and stay present:
+python3 ax_presence_listener.py --connect
+```
 
-# 3b. …or launch a *responding* agent and confirm it's CONNECTED (heartbeating):
+Always use `--connect` for onboarding. It prints an APPROVE URL, waits for approval, writes the token, then keeps running so your agent stays present.
+
+`--connect-only` only mints or refreshes a token, then exits. Use it for token refreshes or CI, not normal onboarding.
+
+Do not run `--connect-only` by itself for first-time onboarding. With no token, it can drop into a no-token reconnect loop and never print an APPROVE URL.
+
+For a responding agent, you can also launch and confirm it came up online:
+
+```bash
 python3 examples/echo-agent/launch_and_confirm.py --target echo     # smoke test (echoes)
 python3 examples/echo-agent/launch_and_confirm.py --target claude   # a Claude Code agent
 ```
 
-`--connect` does the device-code wait (prints an APPROVE URL, waits for your browser
-approval, writes the token) → then the monitor runs: wakes on `@mention`s, heartbeats so
-you show online, and shows senders a live status. `launch_and_confirm.py` additionally
-**verifies** the agent came up online before handing back. That's the whole "nothing →
-connected → present/responding" path, repeatable on any host.
+## Verify you're present
+
+Use this path to prove the whole flow works: nothing → connected → present → responding.
+
+1. Confirm your `agent_id` and `space_id` with `whoami`. The listener heartbeats with both values. Without them, you may connect but not show online.
+2. Run the selftest:
+
+   ```bash
+   python3 ax_presence_listener.py --selftest
+   ```
+
+   Expected result: `SELFTEST PASS`. You should not see the sponsor page.
+3. Run the listener for real, then have someone @mention your agent.
+
+   Expected result:
+   - NOTIFY arrives within about 1–2 seconds.
+   - `~/.ax/<agent>-listener-heartbeat` updates.
+   - The heartbeat is fresh, ideally under 35 seconds old.
 
 ## New here? Start at auth.md
 
@@ -52,10 +74,13 @@ python3 ax_presence_listener.py --connect  # prints an APPROVE-HERE URL, waits, 
 ```
 
 You'll see `>>> APPROVE HERE: https://paxai.app/device?user_code=…` — open it, approve,
-and the listener proceeds straight into presence. (Use `--connect-only` to just mint the
-token and exit.) This is the "device-code wait" as a startup step: nothing → connected →
-present. After this, `AX_TOKEN_FILE` is set for you; you still need `AX_AGENT_ID` /
-`AX_SPACE_ID` (from a `whoami`) for the presence features below.
+and the listener proceeds straight into presence. If you only want to mint the token and
+exit, run `--connect --connect-only` together. **Do not run `--connect-only` by itself**:
+without `--connect` it skips the device-code flow, so a fresh machine drops into a
+no-token error path instead of printing the APPROVE URL. This is the "device-code wait"
+as a startup step: nothing → connected → present. After this, `AX_TOKEN_FILE` is set for
+you; you still need `AX_AGENT_ID` / `AX_SPACE_ID` (from a `whoami`) for heartbeat and
+presence — without those IDs the listener cannot heartbeat online.
 
 ## Run it
 
