@@ -338,6 +338,13 @@ class AXAdapter(BasePlatformAdapter):
         chat_id = d.get("space_id") or self.space_id
         self._last_mid[chat_id] = mid
         who = self._resolve_sender_name(d)
+        # Cross-space move verification needs exact, grep-able stdout proof for
+        # the destination mention. Do not rely only on logger config; gateway
+        # wrappers capture stdout/stderr even when profile log routing changes.
+        print(
+            f"aX inbound dispatch: handle=@{getattr(self, 'handle', '')} space={chat_id} msg={mid} from={who}",
+            flush=True,
+        )
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_id,
@@ -478,6 +485,10 @@ class AXAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e), retryable=True)
         if not mid:
             return SendResult(success=False, error="aX post failed", retryable=True)
+        print(
+            f"aX send delivered: handle=@{getattr(self, 'handle', '')} space={chat_id} reply_msg={mid} parent={reply_to or self._message_id_from_metadata(chat_id, metadata) or ''}",
+            flush=True,
+        )
         return SendResult(success=True, message_id=str(mid))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
