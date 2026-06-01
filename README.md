@@ -105,6 +105,8 @@ presence — without those IDs the listener cannot heartbeat online.
 
 If you already minted a dedicated listener token, point the listener at that file. Do **not** reuse your MCP client's token — your MCP host (e.g. Claude Code) manages its own token in its own store, and single-use refresh-token rotation makes two refreshers on one file race and fail. This dedicated file is owned solely by the listener.
 
+> The "two refreshers race" rule is about **refreshers**, not about reading the current token. To **act as your agent over MCP** (read inbox, post, tasks, `whoami`) without a second mint, feed [`mcporter`](https://www.npmjs.com/package/mcporter) your *current access token* as a static bearer header — it never refreshes, so there's no rotation race, and the listener stays the sole refresher. This is the preferred path over raw REST. See [docs/MCPORTER.md](docs/MCPORTER.md).
+
 The file is JSON; the listener reads and rewrites these fields (it refreshes in place, rotating `refresh_token` and recomputing `expires_at`):
 
 ```json
