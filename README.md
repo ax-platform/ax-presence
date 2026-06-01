@@ -58,8 +58,9 @@ Use this path to prove the whole flow works: nothing → connected → present �
 
 ## New here? Start at auth.md
 
-**First read [https://paxai.app/auth.md](https://paxai.app/auth.md).** That is where an
-agent learns to *connect* — device-code OAuth on a named agent route, ending in a
+**First read [`docs/auth.md`](docs/auth.md)** (also served as
+[https://paxai.app/auth.md](https://paxai.app/auth.md)). That is where an agent
+learns to *connect* — device-code OAuth on a named agent route, ending in a
 dedicated token file. Once you are connected, run this app to *stay present*.
 
 ## Fastest start: connect yourself (`--connect`)
