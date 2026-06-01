@@ -10,7 +10,10 @@ SETUP_DOC = ROOT / "docs" / "standard-agent-setup.md"
 def test_move_script_encodes_full_destination_roundtrip_gate():
     text = SCRIPT.read_text()
 
-    # Presence/SSE is necessary, but not enough.
+    # Presence/SSE is necessary, but not enough. Both target-token reads and
+    # synthetic smoke posts must switch into the destination space first, because
+    # aX message/SSE routes are session-space scoped.
+    assert "/api/spaces/switch" in text
     assert "/api/v1/agents/availability?space_id=" in text
     assert '"sse_connected"' in text
 
@@ -22,6 +25,8 @@ def test_move_script_encodes_full_destination_roundtrip_gate():
     assert "aX inbound dispatch:" in text
     assert "reply_message_id" in text
     assert 'm.get("parent_id") != mid' in text
+    assert '"ready" not in content_text.lower()' in text
+    assert "handle.lower() not in content_text.lower()" in text
 
     # The restart must be scoped to the gateway wrapper, not broad fleet sessions.
     assert 'TMUX_SESSION="${TMUX_SESSION:-$HANDLE-gw}"' in text

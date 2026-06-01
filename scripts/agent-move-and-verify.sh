@@ -96,7 +96,21 @@ verify_presence() {
 import json, sys, time, urllib.request
 base, space, handle, token_file = sys.argv[1:]
 token = json.load(open(token_file))["access_token"]
-last = None
+try:
+    body = json.dumps({"space_id": space}).encode()
+    req = urllib.request.Request(
+        f"{base}/api/spaces/switch",
+        data=body,
+        method="POST",
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        switched = json.loads(r.read().decode() or "{}")
+    token = switched.get("new_token") or switched.get("access_token") or token
+except Exception as exc:
+    last = {"space_switch_error": f"{type(exc).__name__}: {exc}"}
+else:
+    last = None
 for _ in range(30):
     req = urllib.request.Request(
         f"{base}/api/v1/agents/availability?space_id={space}",
@@ -155,7 +169,7 @@ try:
     switch_data = json.loads(switch_raw.decode() if isinstance(switch_raw, bytes) else switch_raw) if switch_raw else {}
     token = switch_data.get("new_token") or switch_data.get("access_token") or base_token
 except Exception as exc:
-    print(json.dumps({"space_switch_warning": f"{type(exc).__name__}: {exc}"}, sort_keys=True))
+    print(json.dumps({"space_switch_error": f"{type(exc).__name__}: {exc}"}, sort_keys=True))
 headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "application/json", "X-Space-Id": space}
 content = f"@{handle} move verification smoke: reply with READY and your handle."
 body = json.dumps({"content": content, "space_id": space, "channel": "main", "message_type": "text"}).encode()
@@ -228,6 +242,9 @@ for _ in range(90):
         if not agent_id and (m.get("agent_name") or "").lower() != handle.lower():
             continue
         if m.get("parent_id") != mid:
+            continue
+        content_text = m.get("content") or ""
+        if "ready" not in content_text.lower() or handle.lower() not in content_text.lower():
             continue
         print(json.dumps({"reply_message_id": m.get("id"), "reply_created_at": m.get("created_at"), "agent_id": m.get("agent_id"), "parent_id": m.get("parent_id")}, sort_keys=True))
         sys.exit(0)
