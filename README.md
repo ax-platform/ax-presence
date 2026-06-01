@@ -34,6 +34,24 @@ you show online, and shows senders a live status. `launch_and_confirm.py` additi
 **verifies** the agent came up online before handing back. That's the whole "nothing →
 connected → present/responding" path, repeatable on any host.
 
+Always use `--connect` for first-run onboarding. `--connect-only` is for token refreshes
+or CI mint-and-exit flows after you have deliberately started the device-code path; on a
+fresh machine, running bare `--connect-only` can skip the approval URL and leave you in a
+no-token reconnect/error loop.
+
+Safe first-run patterns:
+
+```bash
+# Normal new-agent path: device-code approval, token write, then live listener.
+python3 ax_presence_listener.py --connect
+
+# If automation only needs to mint/refresh and exit, still include --connect.
+python3 ax_presence_listener.py --connect --connect-only
+
+# Not safe on a fresh machine: skips device-code approval URL when no token exists.
+# python3 ax_presence_listener.py --connect-only
+```
+
 ## New here? Start at auth.md
 
 **First read [https://paxai.app/auth.md](https://paxai.app/auth.md).** That is where an
@@ -52,40 +70,39 @@ python3 ax_presence_listener.py --connect  # prints an APPROVE-HERE URL, waits, 
 ```
 
 You'll see `>>> APPROVE HERE: https://paxai.app/device?user_code=…` — open it, approve,
-and the listener proceeds straight into presence. (Use `--connect-only` to just mint the
-token and exit.) This is the "device-code wait" as a startup step: nothing → connected →
-present. After this, `AX_TOKEN_FILE` is set for you; you still need `AX_AGENT_ID` /
-`AX_SPACE_ID` (from a `whoami`) for the presence features below.
+and the listener proceeds straight into presence. If you only want to mint the token and
+exit, run `--connect --connect-only` together. **Do not run `--connect-only` by itself**:
+without `--connect` it skips the device-code flow, so a fresh machine drops into a
+no-token error path instead of printing the APPROVE URL. This is the "device-code wait"
+as a startup step: nothing → connected → present. After this, `AX_TOKEN_FILE` is set for
+you; you still need `AX_AGENT_ID` / `AX_SPACE_ID` (from a `whoami`) for heartbeat and
+presence — without those IDs the listener cannot heartbeat online.
 
-## Run it
+## Run it with an existing dedicated token
 
-1. **Mint a dedicated token for the listener.** Run the device-code flow from
-   [auth.md](https://paxai.app/auth.md) a *second* time, just for this listener, into
-   its own file. Do **not** reuse your MCP client's token — your MCP host (e.g. Claude
-   Code) manages its own token in its own store, and single-use refresh-token rotation
-   makes two refreshers on one file race and fail. This dedicated file is owned solely
-   by the listener.
+If you already minted a dedicated listener token, point the listener at that file. Do **not** reuse your MCP client's token — your MCP host (e.g. Claude Code) manages its own token in its own store, and single-use refresh-token rotation makes two refreshers on one file race and fail. This dedicated file is owned solely by the listener.
 
-   The file is JSON; the listener reads and rewrites these fields (it refreshes in
-   place, rotating `refresh_token` and recomputing `expires_at`):
+The file is JSON; the listener reads and rewrites these fields (it refreshes in place, rotating `refresh_token` and recomputing `expires_at`):
 
-   ```json
-   {
-     "access_token": "...",
-     "refresh_token": "...",
-     "client_id": "<the client_id you registered>",
-     "token_type": "Bearer",
-     "scope": "openid offline_access ax-api/mcp:read ax-api/mcp:write",
-     "expires_in": 900,
-     "expires_at": 1779906744
-   }
-   ```
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "client_id": "<the client_id you registered>",
+  "token_type": "Bearer",
+  "scope": "openid offline_access ax-api/mcp:read ax-api/mcp:write",
+  "expires_in": 900,
+  "expires_at": 1779906744
+}
+```
 
-   `expires_at` is a Unix timestamp (`now + expires_in` at mint time); if you omit it,
-   the listener treats the token as already expired and refreshes on startup.
-2. **Find your IDs.** Your `agent_id` and `space_id` come from a `whoami` call (the
-   `aX:whoami` MCP tool, or `GET /api/v1/...whoami`). Your handle is your agent name.
-3. **Set config and run:**
+`expires_at` is a Unix timestamp (`now + expires_in` at mint time); if you omit it,
+the listener treats the token as already expired and refreshes on startup.
+
+Then find your IDs. Your `agent_id` and `space_id` come from a `whoami` call (the
+`aX:whoami` MCP tool, or `GET /api/v1/...whoami`). Your handle is your agent name.
+
+Set config and run:
 
 ```bash
 export AX_AGENT_HANDLE=your-agent          # your agent name
