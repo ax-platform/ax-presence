@@ -42,11 +42,16 @@ def load_adapter_module():
         def __init__(self, name):
             self.name = name
 
+    class HomeChannel:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     base.BasePlatformAdapter = BasePlatformAdapter
     base.SendResult = SendResult
     base.MessageEvent = MessageEvent
     base.MessageType = MessageType
     config.Platform = Platform
+    setattr(config, "HomeChannel", HomeChannel)
 
     sys.modules["gateway"] = gateway
     sys.modules["gateway.platforms"] = platforms
@@ -168,6 +173,98 @@ class AXAdapterNoReplyTest(unittest.TestCase):
                     "emoji": "",
                 },
             )
+
+        asyncio.run(run())
+
+    def test_post_message_uses_cached_parent_channel_for_threaded_reply(self):
+        class Response:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body
+
+        posted_payloads = []
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url == self.module.ax.MESSAGES_URL:
+                posted_payloads.append(__import__("json").loads(req.data.decode()))
+                return Response(b'{"message":{"id":"reply-1"}}')
+            if req.full_url == self.module.ax.MESSAGES_URL + "/reply-1":
+                return Response(
+                    b'{"message":{"id":"reply-1","sender_type":"agent",'
+                    b'"agent_id":"agent-1","parent_id":"parent-1","space_id":"space-1"}}'
+                )
+            raise AssertionError(f"unexpected url {req.full_url}")
+
+        self.adapter.agent_id = "agent-1"
+        self.adapter._message_channels = {"parent-1": "activity"}
+        self.adapter._access_token_for_space = lambda space_id: "read-token"
+        with mock.patch.object(self.module.ax, "current_access_token", return_value="token"), \
+             mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mid = self.adapter._post_message("hello", parent_id="parent-1", space_id="space-1")
+
+        self.assertEqual(mid, "reply-1")
+        self.assertEqual(posted_payloads[0]["channel"], "activity")
+
+    def test_post_message_fetches_parent_channel_when_sse_event_omitted_it(self):
+        class Response:
+            def __init__(self, body):
+                self._body = body
+                self.headers = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body
+
+        posted_payloads = []
+        fetched_parent_headers = []
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url == self.module.ax.MESSAGES_URL + "/parent-1":
+                fetched_parent_headers.append(dict(req.headers))
+                return Response(b'{"message":{"id":"parent-1","channel":"activity"}}')
+            if req.full_url == self.module.ax.MESSAGES_URL:
+                posted_payloads.append(__import__("json").loads(req.data.decode()))
+                return Response(b'{"message":{"id":"reply-1"}}')
+            if req.full_url == self.module.ax.MESSAGES_URL + "/reply-1":
+                return Response(
+                    b'{"message":{"id":"reply-1","sender_type":"agent",'
+                    b'"agent_id":"agent-1","parent_id":"parent-1","space_id":"space-1"}}'
+                )
+            raise AssertionError(f"unexpected url {req.full_url}")
+
+        self.adapter.agent_id = "agent-1"
+        self.adapter._message_channels = {}
+        self.adapter._access_token_for_space = lambda space_id: "read-token"
+        with mock.patch.object(self.module.ax, "current_access_token", return_value="token"), \
+             mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mid = self.adapter._post_message("hello", parent_id="parent-1", space_id="space-1")
+
+        self.assertEqual(mid, "reply-1")
+        self.assertEqual(posted_payloads[0]["channel"], "activity")
+        self.assertEqual(self.adapter._message_channels["parent-1"], "activity")
+        self.assertEqual(fetched_parent_headers[0]["X-space-id"], "space-1")
+
+    def test_send_threads_to_metadata_message_id_when_reply_to_missing(self):
+        async def run():
+            self.adapter._last_mid["space-1"] = "parent-1"
+            with mock.patch.object(self.adapter, "_post_message", return_value="reply-1") as post:
+                result = await self.adapter.send("space-1", "final answer", metadata={"message_id": "parent-1"})
+            self.assertTrue(result.success)
+            post.assert_called_once_with("final answer", "parent-1", "space-1")
 
         asyncio.run(run())
 

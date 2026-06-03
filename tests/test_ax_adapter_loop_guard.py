@@ -1,5 +1,9 @@
 import importlib.util
+import io
 import json
+import os
+import urllib.error
+import urllib.request
 import sys
 import types
 import unittest
@@ -20,10 +24,20 @@ def load_adapter_module():
 
     class BasePlatformAdapter:
         def __init__(self, *args, **kwargs):
-            pass
+            self.config = kwargs.get("config")
+            self.platform = kwargs.get("platform")
 
         def build_source(self, **kwargs):
             return types.SimpleNamespace(platform=getattr(self, "platform", None), **kwargs)
+
+        def _mark_connected(self):
+            self.connected = True
+
+        def _mark_disconnected(self):
+            self.connected = False
+
+        def _set_fatal_error(self, *args, **kwargs):
+            self.fatal_error = (args, kwargs)
 
     class SendResult:
         def __init__(self, success, message_id=None, error=None, raw_response=None, retryable=False, continuation_message_ids=()):
@@ -45,10 +59,15 @@ def load_adapter_module():
         def __init__(self, name):
             self.name = name
 
+    class HomeChannel:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     setattr(base, "BasePlatformAdapter", BasePlatformAdapter)
     setattr(base, "SendResult", SendResult)
     setattr(base, "MessageEvent", MessageEvent)
     setattr(base, "MessageType", MessageType)
+    setattr(config, "HomeChannel", HomeChannel)
     setattr(config, "Platform", Platform)
 
     sys.modules.setdefault("gateway", gateway)
@@ -101,6 +120,31 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
     def setUp(self):
         self.adapter = make_adapter(self.module)
 
+    def test_home_channel_uses_agent_record_space_not_configured_home_space(self):
+        config = types.SimpleNamespace(
+            extra={"space_id": "configured-space", "home_space": "extra-home-space"},
+            home_channel=None,
+        )
+        with mock.patch.dict(os.environ, {"AX_HOME_SPACE": "env-home-space"}):
+            adapter = self.module.AXAdapter(config)
+
+        self.assertEqual(adapter.home_space, "")
+        adapter._apply_space_id("db-space")
+
+        self.assertEqual(adapter.space_id, "db-space")
+        self.assertEqual(adapter.home_space, "db-space")
+        self.assertEqual(config.home_channel.chat_id, "db-space")
+
+    def test_register_does_not_advertise_ax_home_space_env_fallback(self):
+        class Ctx:
+            def register_platform(self, **kwargs):
+                self.kwargs = kwargs
+
+        ctx = Ctx()
+        self.module.register(ctx)
+
+        self.assertEqual(ctx.kwargs["cron_deliver_env_var"], "")
+
     def test_peer_short_ack_mention_is_suppressed_immediately_before_dispatch(self):
         ack_shapes = [
             "@peach roger",
@@ -146,6 +190,28 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
 
             self.assertFalse(self.adapter._is_agent_ack_loop_candidate(first))
             self.assertTrue(self.adapter._is_agent_ack_loop_candidate(second))
+
+    def test_ax_mention_prefixed_slash_commands_are_normalized_for_hermes(self):
+        cases = {
+            "@nyx /commands": "/commands",
+            "@nyx: /status": "/status",
+            " @nyx — /help": "/help",
+            "@atlas @nyx /model openai/gpt-5.5": "/model openai/gpt-5.5",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(self.adapter._normalize_inbound_text(raw), expected)
+
+    def test_ax_mention_normalization_does_not_rewrite_prose_or_mid_text_slashes(self):
+        cases = [
+            "@nyx please run /commands if needed",
+            "please @nyx /commands",
+            "hello @nyx",
+            "/commands @nyx",
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.adapter._normalize_inbound_text(raw), raw)
 
     def test_no_reply_safe_word_matches_only_standalone_command_case_insensitive(self):
         positive = [
@@ -208,14 +274,70 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(self.adapter._is_no_reply_output_sentinel(text))
 
-    def test_event_space_guard_rejects_mentions_from_other_spaces(self):
+    def test_event_space_guard_allows_any_discovered_subscription_space(self):
         self.adapter.space_id = "dest-space"
+        self.adapter._subscribed_spaces = {"dest-space", "home-space"}
         self.assertTrue(self.adapter._event_space_matches({"id": "msg-ok", "space_id": "dest-space"}))
-        self.assertFalse(self.adapter._event_space_matches({"id": "msg-old", "space_id": "home-space"}))
+        self.assertTrue(self.adapter._event_space_matches({"id": "msg-home", "space_id": "home-space"}))
+        self.assertFalse(self.adapter._event_space_matches({"id": "msg-other", "space_id": "other-space"}))
 
     def test_event_space_guard_allows_legacy_events_without_space_id(self):
         self.adapter.space_id = "dest-space"
+        self.adapter._subscribed_spaces = {"dest-space", "home-space"}
         self.assertTrue(self.adapter._event_space_matches({"id": "msg-legacy"}))
+
+    def test_subscribed_space_discovery_is_db_assigned_only(self):
+        # SECURITY: discovery must honor ONLY the DB-assigned space, never the
+        # token's is_member set (which caused cross-space leaks). It must not
+        # even call /api/v1/spaces.
+        self.adapter.space_id = "dest-space"
+        called = []
+
+        def fake_urlopen(req, timeout=0):
+            called.append(req)
+            return _HTTPResponse(json.dumps({"spaces": [{"id": "other-space", "is_member": True}]}).encode())
+
+        with mock.patch.object(self.module.ax, "current_access_token", return_value="token"), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            spaces = self.adapter._discover_subscribed_spaces()
+
+        self.assertEqual(spaces, ["dest-space"])
+        self.assertEqual(called, [])  # no is_member enumeration
+
+    def test_subscribed_space_discovery_includes_explicit_db_authorized_spaces(self):
+        # If the agent record explicitly authorizes extra spaces, honor those
+        # (DB-authoritative) — but still nothing from is_member.
+        self.adapter.space_id = "dest-space"
+        self.adapter._authorized_space_ids = ["extra-authorized"]
+        spaces = self.adapter._discover_subscribed_spaces()
+        self.assertEqual(spaces, ["dest-space", "extra-authorized"])
+
+    def test_connect_starts_sse_readers_for_all_discovered_spaces(self):
+        calls = []
+
+        def record_reader(space_id=None):
+            calls.append(space_id)
+
+        async def run():
+            config = types.SimpleNamespace(extra={"handle": "nyx", "token_file": "/tmp/token.json"}, home_channel=None)
+            adapter = self.module.AXAdapter(config)
+            adapter._sse_reader = record_reader
+            with mock.patch("os.path.exists", return_value=True), \
+                 mock.patch.object(self.module.ax, "current_access_token", return_value="token"), \
+                 mock.patch.object(self.module.ax, "proactive_refresh_loop", return_value=None), \
+                 mock.patch.object(self.module.ax, "presence_loop", return_value=None), \
+                 mock.patch.object(adapter, "_derive_agent_space_id", return_value="dest-space"), \
+                 mock.patch.object(adapter, "_discover_subscribed_spaces", return_value=["dest-space", "home-space"]):
+                connected = await adapter.connect()
+                await asyncio.sleep(0.05)
+
+            self.assertTrue(connected)
+            self.assertEqual(adapter._subscribed_spaces, {"dest-space", "home-space"})
+            self.assertEqual(calls, ["dest-space", "home-space"])
+            self.assertEqual([t.name for t in adapter._reader_threads], ["ax-sse-dest-spa", "ax-sse-home-spa"])
+
+        import asyncio
+        asyncio.run(run())
 
     def test_send_translates_no_reply_output_sentinel_to_no_reply_status(self):
         async def run():
@@ -303,7 +425,9 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertEqual(result.message_id, "reply-1")
             post_status.assert_not_called()
-            post_message.assert_called_once_with("✅ Done — adapter tests pass.", None, "space-1")
+            # Final answers are chat replies, not activity updates, and should
+            # remain threaded to the inbound message when gateway metadata carries it.
+            post_message.assert_called_once_with("✅ Done — adapter tests pass.", "msg-123", "space-1")
 
         import asyncio
         asyncio.run(run())
@@ -400,6 +524,8 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
 
         def fake_urlopen(req, timeout=None):
             calls.append((req.full_url, req.get_method()))
+            if req.full_url == self.module.ax.MESSAGES_URL + "/msg-123":
+                return _HTTPResponse(json.dumps({"message": {"id": "msg-123", "channel": "main"}}).encode())
             if req.full_url == self.module.ax.MESSAGES_URL:
                 return _HTTPResponse(json.dumps({"message": {"id": "reply-1"}}).encode())
             if req.full_url == self.module.ax.MESSAGES_URL + "/reply-1":
@@ -421,9 +547,36 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
 
         self.assertEqual(mid, "reply-1")
         self.assertEqual(calls, [
+            (self.module.ax.MESSAGES_URL + "/msg-123", "GET"),
             (self.module.ax.MESSAGES_URL, "POST"),
             (self.module.ax.MESSAGES_URL + "/reply-1", "GET"),
         ])
+
+    def test_post_message_logs_sanitized_400_diagnostics(self):
+        def fake_urlopen(req, timeout=None):
+            body = b'{"error":"cannot reply to reminder/activity card parent"}'
+            raise urllib.error.HTTPError(
+                req.full_url,
+                400,
+                "Bad Request",
+                {"content-type": "application/json"},
+                io.BytesIO(body),
+            )
+
+        with mock.patch.object(self.module.ax, "current_access_token", return_value="token"), \
+             mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+             self.assertLogs("gateway.platforms.ax", level="WARNING") as logs:
+            mid = self.adapter._post_message("hello secret-ish content", "reminder-123", "space-1")
+
+        self.assertIsNone(mid)
+        joined = "\n".join(logs.output)
+        self.assertIn("status=400", joined)
+        self.assertIn("parent=reminder-123", joined)
+        self.assertIn("classification=reply_to_activity_or_reminder_parent", joined)
+        self.assertIn("content_len=24", joined)
+        self.assertIn("content_sha=", joined)
+        self.assertIn("cannot reply to reminder/activity card parent", joined)
+        self.assertNotIn("hello secret-ish content", joined)
 
     def test_post_message_readback_fails_closed_when_identity_or_threading_is_stripped(self):
         cases = [

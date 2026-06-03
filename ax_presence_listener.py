@@ -32,7 +32,7 @@ import urllib.request, urllib.parse, urllib.error
 # --- Per-agent config (set these, or override via AX_* env vars) -------------
 AGENT_HANDLE = os.environ.get("AX_AGENT_HANDLE", "your-agent")
 AGENT_ID     = os.environ.get("AX_AGENT_ID", "<your-agent-uuid>")
-SPACE_ID     = os.environ.get("AX_SPACE_ID", "<your-space-uuid>")
+SPACE_ID     = os.environ.get("AX_SPACE_ID", "")
 SPONSOR      = os.environ.get("AX_SPONSOR", "@your-sponsor")  # gets failure alerts
 TOKEN_FILE   = os.path.expanduser(
     os.environ.get("AX_TOKEN_FILE", f"~/.ax/{AGENT_HANDLE}-listener.json"))
@@ -99,6 +99,38 @@ def alert(text):
             headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"}), timeout=10)
     except Exception as e:
         print(f"[listener] alert POST failed (in-session wake still fired): {e!r}", file=sys.stderr, flush=True)
+
+
+def derive_space_id_from_agent_record():
+    """Return this agent's authoritative space_id from the aX agent record."""
+    global SPACE_ID
+    if SPACE_ID and SPACE_ID != "<your-space-uuid>":
+        return SPACE_ID
+    try:
+        at = current_access_token()
+        paths = []
+        if AGENT_ID and AGENT_ID != "<your-agent-uuid>":
+            paths.append(f"/api/v1/agents/{AGENT_ID}")
+        paths.append("/api/v1/agents/me")
+        for path in paths:
+            req = urllib.request.Request(
+                BASE + path,
+                headers={"Authorization": "Bearer " + at, "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read()
+            data = json.loads(raw.decode() if raw else "{}")
+            agent = data.get("agent") if isinstance(data, dict) else None
+            if isinstance(agent, dict):
+                data = agent
+            space = data.get("space_id") if isinstance(data, dict) else None
+            if space:
+                SPACE_ID = str(space)
+                print(f"[listener] derived space_id for @{AGENT_HANDLE}: {SPACE_ID}", flush=True)
+                return SPACE_ID
+    except Exception as e:
+        print(f"[listener] space_id lookup failed: {e!r}", file=sys.stderr, flush=True)
+    return SPACE_ID
 
 
 def build_processing_body(mid, status, activity=None, tool_name=None, progress=None, detail=None):
@@ -325,6 +357,7 @@ def keeper(mid, stop):
 
 
 def presence_loop():
+    derive_space_id_from_agent_record()
     """Publish liveness to the PLATFORM: POST /api/v1/agents/heartbeat every ~20s
     (server TTL ~30s) so this agent shows 'online' + responsive in the agents
     presence/availability views. The endpoints already exist server-side; the
@@ -845,6 +878,7 @@ def _acquire_singleton_lock():
 def main():
     _acquire_singleton_lock()
     _install_exit_alert()
+    derive_space_id_from_agent_record()
     threading.Thread(target=proactive_refresh_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=presence_loop, daemon=True).start()
