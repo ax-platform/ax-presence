@@ -7,16 +7,19 @@
 # (gpt-5.5 brain on a Hermes body, behind peach's ax-presence monitor).
 #
 # Usage:
-#   scripts/standup-agent.sh <handle> [target] [space_id]
+#   scripts/standup-agent.sh <handle> [target] [bootstrap_space_id]
 #     handle    NEW agent handle (e.g. zephyr)            (required)
 #     target    hermes | claude | echo                    (default: hermes)
-#     space_id  aX space                                  (default: $AX_SPACE_ID)
+#     bootstrap_space_id  only needed for first device-code token mint;
+#                         Hermes gateways derive current space from aX DB
 #
 # Env knobs:
 #   AGENTS_ROOT        where agent homes live   (default: /home/ax-agents/agents)
 #   REUSE_AUTH_FROM    an existing authed HERMES_HOME whose config.yaml + auth.json
 #                      to copy (the shared-Codex-login pattern). If unset and the
 #                      backend isn't authed, the script tells you to run `hermes setup`.
+#   HERMES_MODEL       model written to config.yaml when not reusing config (default: gpt-5.5)
+#   HERMES_PROVIDER    provider written to config.yaml when not reusing config (default: openai-codex)
 #   AX_SPONSOR         handle that receives failure alerts (default: @madtank)
 #
 # Notes baked in from hard-won experience:
@@ -44,14 +47,20 @@ TARGET="${2:-hermes}"
 SPACE_ID="${3:-${AX_SPACE_ID:-}}"
 AGENTS_ROOT="${AGENTS_ROOT:-/home/ax-agents/agents}"
 SPONSOR="${AX_SPONSOR:-@madtank}"
+HERMES_MODEL="${HERMES_MODEL:-gpt-5.5}"
+HERMES_PROVIDER="${HERMES_PROVIDER:-openai-codex}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="$AGENTS_ROOT/$HANDLE"
 export PATH="$HOME/.local/bin:$PATH"
 
-[ -n "$SPACE_ID" ] || { echo "standup: set space_id (arg 3) or AX_SPACE_ID" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "standup: python3 not found" >&2; exit 1; }
 
-echo "standup: @$HANDLE  target=$TARGET  home=$HOME_DIR  space=$SPACE_ID"
+if [ "$TARGET" = "hermes" ]; then
+  exec "$REPO/scripts/standup-gateway.sh" "$HANDLE" "$SPACE_ID"
+fi
+
+[ -n "$SPACE_ID" ] || { echo "standup: target=$TARGET needs bootstrap_space_id (arg 3) or AX_SPACE_ID" >&2; exit 1; }
+echo "standup: @$HANDLE  target=$TARGET  home=$HOME_DIR  bootstrap_space=$SPACE_ID  model=$HERMES_PROVIDER/$HERMES_MODEL"
 mkdir -p "$HOME_DIR"
 
 # ---- backend (Plane 2: the agent's own model auth) --------------------------
@@ -64,10 +73,10 @@ if [ "$TARGET" = "hermes" ]; then
       cp "$REUSE_AUTH_FROM/auth.json"   "$HOME_DIR/auth.json"
       chmod 600 "$HOME_DIR/auth.json"
     else
-      cat > "$HOME_DIR/config.yaml" <<'YAML'
+      cat > "$HOME_DIR/config.yaml" <<YAML
 model:
-  default: gpt-5.5
-  provider: openai-codex
+  default: $HERMES_MODEL
+  provider: $HERMES_PROVIDER
 YAML
       echo "standup: no backend auth yet. Run ONE of:"
       echo "    HERMES_HOME=$HOME_DIR hermes setup --portal        # Nous Portal OAuth"

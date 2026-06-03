@@ -24,9 +24,9 @@ For compatibility with the onboarding shorthand, this is also reachable as:
 
 The move script does the following:
 
-1. Updates the run script to export the destination `AX_SPACE_ID` and `AX_HOME_SPACE`.
+1. Removes static `AX_SPACE_ID` / `AX_HOME_SPACE` exports from the run script so home/default delivery is derived from the aX DB agent record on reconnect.
 2. Stops only the scoped gateway tmux session (`<handle>-gw`), not a bare attached `<handle>` workspace.
-3. Relaunches a single Hermes gateway listener for that handle.
+3. Relaunches a single Hermes gateway listener for that handle; the adapter reads the backend agent record, applies that space as Hermes home, and opens destination-space SSE.
 4. Verifies fresh destination-space availability/SSE via `/api/v1/agents/availability?space_id=<destination>` using the target listener token (`TARGET_TOKEN_FILE`, default `$HOME/.ax/<handle>-listener.json`).
 5. If `--post-smoke` is supplied, posts one synthetic destination-space direct mention, reads back the message routing metadata, fails if `metadata.routing_story.targets[]` does not resolve the expected handle/agent id, verifies the target gateway log saw that exact message id, and polls for the target agent reply. Without `--post-smoke`, it prints the availability/SSE evidence and explicitly stops short of calling the agent `ready` until reply proof exists.
 
