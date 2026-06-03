@@ -15,10 +15,6 @@ requires_env:
     description: "The agent's aX handle (selects its named-agent MCP route), e.g. daimon"
     prompt: "aX agent handle"
     password: false
-  - name: AX_SPACE_ID
-    description: "aX space (workspace) UUID the agent operates in"
-    prompt: "aX space id"
-    password: false
   - name: AX_TOKEN_FILE
     description: "Path to the aX-native device-code token file (the adapter owns/rotates it). NOT a Hermes MCP paste-back token — see README."
     prompt: "aX token file path"
@@ -32,9 +28,9 @@ optional_env:
     description: "Directory containing ax_presence_listener.py (default /home/ax-agents/ax-presence)"
     prompt: "ax-presence dir"
     password: false
-  - name: AX_HOME_SPACE
-    description: "Default space for cron (deliver=ax) delivery (defaults to AX_SPACE_ID)"
-    prompt: "aX home space (or empty)"
+  - name: AX_SPACE_ID
+    description: "Bootstrap-only fallback space for first token mint; connected agents derive current placement from the backend agent record"
+    prompt: "aX bootstrap space id (optional)"
     password: false
   - name: AX_ALLOWED_USERS
     description: "Comma-separated aX agent/user ids allowed to talk to this agent"

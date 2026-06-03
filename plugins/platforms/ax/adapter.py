@@ -17,14 +17,14 @@ to (a) own the connection under a lock, (b) bridge the blocking SSE reader to th
 gateway's asyncio loop as MessageEvents, and (c) post replies + typing back.
 
 Env (set per agent by the gateway process; see plugin.yaml):
-  AX_AGENT_HANDLE, AX_AGENT_ID, AX_SPACE_ID, AX_TOKEN_FILE  (required)
+  AX_AGENT_HANDLE, AX_AGENT_ID, AX_TOKEN_FILE  (required)
   AX_PRESENCE_DIR   - dir containing ax_presence_listener.py (default below)
-  AX_HOME_SPACE     - cron delivery target space (default: AX_SPACE_ID)
   AX_ALLOW_ALL_USERS / AX_ALLOWED_USERS - gateway authorization
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import sys
@@ -42,7 +42,7 @@ import ax_presence_listener as ax  # noqa: E402  (path set above)
 from gateway.platforms.base import (  # noqa: E402
     BasePlatformAdapter, SendResult, MessageEvent, MessageType,
 )
-from gateway.config import Platform  # noqa: E402
+from gateway.config import HomeChannel, Platform  # noqa: E402
 
 import logging  # noqa: E402
 logger = logging.getLogger("gateway.platforms.ax")
@@ -64,18 +64,26 @@ class AXAdapter(BasePlatformAdapter):
         self.token_file = os.path.expanduser(
             os.getenv("AX_TOKEN_FILE") or extra.get("token_file", "")
         )
-        self.home_space = os.getenv("AX_HOME_SPACE") or extra.get("home_space", self.space_id)
+        # Home-channel routing must come from the backend agent record, not a
+        # launch/config "home space" override.  Moved agents otherwise keep
+        # leaking cron/default sends to a stale space.
+        self.home_space = ""
 
         # asyncio loop captured in connect(); the blocking SSE reader thread uses
         # run_coroutine_threadsafe to dispatch onto it.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._reader_thread: Optional[threading.Thread] = None
+        self._reader_threads: List[threading.Thread] = []
         self._refresh_thread: Optional[threading.Thread] = None
         self._running = False
         self._lock_key: Optional[str] = None
         # last inbound message id per chat -> lets send_typing() target the right
         # message for the aX processing-status (typing/activity) surface.
         self._last_mid: Dict[str, str] = {}
+        # inbound message id -> aX channel. Final replies must use the same
+        # channel as their parent; the backend rejects replies from main ->
+        # activity parents with HTTP 400.
+        self._message_channels: Dict[str, str] = {}
         # dedup: the backend can emit the same mention more than once (and a
         # reconnect can replay); without this a 2nd dispatch queues mid-run and
         # trips the gateway's "queued follow-up" resend -> duplicate reply.
@@ -97,6 +105,10 @@ class AXAdapter(BasePlatformAdapter):
         # final agent reply POSTs use the base agent token plus X-Agent-Id/X-Space-Id.
         self._space_token: Dict[str, tuple[str, float]] = {}
         self._space_token_lock = threading.Lock()
+        # Spaces with active SSE subscriptions. This must stay aligned with the
+        # authoritative backend agent-record space; membership in other spaces is
+        # not routing authority and must not wake the agent there.
+        self._subscribed_spaces: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -104,10 +116,10 @@ class AXAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ─────────────────────────────────────────────────────
     async def connect(self) -> bool:
-        if not (self.handle and self.space_id and self.token_file):
+        if not (self.handle and self.token_file):
             self._set_fatal_error(
                 "config_missing",
-                "AX_AGENT_HANDLE, AX_SPACE_ID and AX_TOKEN_FILE must be set",
+                "AX_AGENT_HANDLE and AX_TOKEN_FILE must be set",
                 retryable=False,
             )
             return False
@@ -141,6 +153,35 @@ class AXAdapter(BasePlatformAdapter):
             self._set_fatal_error("auth_failed", f"aX token refresh failed: {e!r}", retryable=True)
             return False
 
+        try:
+            derived_space = await asyncio.get_running_loop().run_in_executor(
+                None, self._derive_agent_space_id
+            )
+        except Exception as e:
+            self._set_fatal_error(
+                "space_lookup_failed",
+                f"aX agent space lookup failed: {e!r}",
+                retryable=True,
+            )
+            return False
+        if derived_space:
+            configured_space = self.space_id
+            self._apply_space_id(derived_space)
+            if configured_space and str(configured_space) != str(derived_space):
+                logger.warning(
+                    "aX: ignoring configured space %s for @%s; backend agent record says %s",
+                    configured_space,
+                    self.handle,
+                    derived_space,
+                )
+        elif not self.space_id:
+            self._set_fatal_error(
+                "space_missing",
+                "aX agent record did not include space_id",
+                retryable=True,
+            )
+            return False
+
         self._loop = asyncio.get_running_loop()
         self._running = True
         # Keep the token fresh for the life of the held SSE connection (serialized
@@ -151,18 +192,136 @@ class AXAdapter(BasePlatformAdapter):
         # Platform heartbeat (POST /api/v1/agents/heartbeat ~every 20s) so the
         # agent shows Online in the availability views. Without this a live
         # gateway agent reads Dormant/Offline (it never POSTs liveness). Uses
-        # AGENT_ID/SPACE_ID from env — no dependence on listener stream globals.
+        # the listener module globals hydrated from the backend agent record.
         self._heartbeat_thread = threading.Thread(
             target=ax.presence_loop, name="ax-heartbeat", daemon=True)
         self._heartbeat_thread.start()
-        # Blocking SSE reader -> bridges events onto the asyncio loop.
-        self._reader_thread = threading.Thread(
-            target=self._sse_reader, name="ax-sse", daemon=True)
-        self._reader_thread.start()
+        # Blocking SSE reader(s) -> bridge events from each subscribed member
+        # space onto the asyncio loop. The backend agent-record space remains the
+        # Hermes home/default target, while mentions in other member spaces are
+        # real wake targets too.
+        subscribed_spaces = await asyncio.get_running_loop().run_in_executor(
+            None, self._discover_subscribed_spaces
+        )
+        self._subscribed_spaces = set(subscribed_spaces)
+        self._reader_threads = []
+        for sid in subscribed_spaces:
+            t = threading.Thread(
+                target=self._sse_reader,
+                args=(sid,),
+                name=f"ax-sse-{sid[:8]}",
+                daemon=True,
+            )
+            t.start()
+            self._reader_threads.append(t)
+        self._reader_thread = self._reader_threads[0] if self._reader_threads else None
 
         self._mark_connected()
-        logger.info("aX: connected as @%s on space %s", self.handle, self.space_id)
+        logger.info("aX: connected as @%s on home space %s; subscribed spaces=%s",
+                    self.handle, self.space_id, sorted(self._subscribed_spaces))
         return True
+
+    def _derive_agent_space_id(self) -> str:
+        """Read the authoritative aX placement from the agent record.
+
+        Launch scripts must not pin a space. The backend agent row owns current
+        placement, so moved agents do not drift into "connected but ignoring the
+        intended space" state.
+        """
+        import json as _json
+        import urllib.request
+
+        token = ax.current_access_token()
+        paths = []
+        if self.agent_id:
+            paths.append(f"/api/v1/agents/{self.agent_id}")
+        paths.append("/api/v1/agents/me")
+        for path in paths:
+            req = urllib.request.Request(
+                f"{ax.BASE}{path}",
+                headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read()
+            data = _json.loads(raw.decode() if raw else "{}")
+            agent = data.get("agent") if isinstance(data, dict) else None
+            if isinstance(agent, dict):
+                data = agent
+            space = data.get("space_id") if isinstance(data, dict) else None
+            if space:
+                return str(space)
+        return ""
+
+    def _apply_space_id(self, space_id: str) -> None:
+        self.space_id = str(space_id)
+        # The caller passes only the authoritative backend agent-record space.
+        # Keep Hermes' home channel aligned with that record and ignore any
+        # stale launch/config home-space value that may still exist in env.
+        self.home_space = self.space_id
+        try:
+            hc = HomeChannel(
+                platform=Platform("ax"),
+                chat_id=self.home_space,
+                name="aX home space",
+            )
+            # Legacy top-level attr (kept for any direct readers).
+            self.config.home_channel = hc
+            # Authoritative slot: Hermes' get_home_channel() reads
+            # config.platforms[<platform>].home_channel. Populate it from the
+            # DB-derived space so the gateway has a home channel WITHOUT any
+            # AX_HOME_SPACE/AX_HOME_CHANNEL env var and WITHOUT a manual
+            # /sethome. Without this, run.py emits a "No home channel is set"
+            # prompt on every fresh inbound and cron/cross-platform delivery
+            # has no destination.
+            pc = self.config.platforms.get(Platform("ax"))
+            if pc is None:
+                from gateway.config import PlatformConfig
+                pc = PlatformConfig(enabled=True)
+                self.config.platforms[Platform("ax")] = pc
+            pc.home_channel = hc
+        except Exception:
+            pass
+        ax.SPACE_ID = self.space_id
+        if self.agent_id:
+            ax.AGENT_ID = self.agent_id
+        if self.handle:
+            ax.AGENT_HANDLE = self.handle
+        if self.token_file:
+            ax.TOKEN_FILE = self.token_file
+
+    @staticmethod
+    def _ordered_unique(values: List[str]) -> List[str]:
+        seen = set()
+        ordered = []
+        for value in values:
+            if not value:
+                continue
+            text = str(value)
+            if text in seen:
+                continue
+            seen.add(text)
+            ordered.append(text)
+        return ordered
+
+    def _discover_subscribed_spaces(self) -> List[str]:
+        """Return spaces that should have live SSE subscriptions.
+
+        SECURITY: an agent must operate ONLY in the space its backend DB record
+        authorizes — its ``space_id`` (and any explicit ``space_access``), and
+        NOTHING ELSE. Subscribing to every space the token can *see*
+        (``GET /api/v1/spaces`` ``is_member``) made agents wake & respond in
+        spaces they were never placed in (e.g. a predictions-lab agent replying
+        in the owner's personal workspace) — a cross-space data-leak. We honor
+        the DB placement only.
+        """
+        home = str(self.space_id or "")
+        spaces = [home] if home else []
+        # If the agent record exposed additional explicitly-authorized spaces,
+        # include only those (DB-authoritative); never fall back to is_member.
+        for sid in (getattr(self, "_authorized_space_ids", None) or []):
+            if sid:
+                spaces.append(str(sid))
+        return self._ordered_unique(spaces)
 
     async def disconnect(self) -> None:
         self._running = False
@@ -223,21 +382,23 @@ class AXAdapter(BasePlatformAdapter):
         return base_token
 
     # ── Inbound: blocking SSE reader bridged to asyncio ──────────────────────────
-    def _sse_reader(self) -> None:
+    def _sse_reader(self, space_id: Optional[str] = None) -> None:
         """Reuse the listener's SSE shape, but dispatch each @mention into the
         gateway via run_coroutine_threadsafe instead of printing a NOTIFY line.
         Reconnects with capped backoff while self._running."""
         import json
         import urllib.request
+        reader_space = str(space_id or self.space_id or "")
         backoff = 1.0
         while self._running:
             try:
                 req = urllib.request.Request(ax.SSE_URL, headers={
-                    "Authorization": "Bearer " + self._access_token_for_space(self.space_id),
+                    "Authorization": "Bearer " + self._access_token_for_space(reader_space),
                     "Accept": "text/event-stream",
+                    "X-Space-Id": reader_space,
                 })
                 r = urllib.request.urlopen(req, timeout=None)
-                logger.info("aX: SSE connected, watching @%s mentions", self.handle)
+                logger.info("aX: SSE connected, watching @%s mentions in space %s", self.handle, reader_space)
                 backoff = 1.0  # reset on a clean connect
                 event = None
                 for raw in r:
@@ -253,11 +414,10 @@ class AXAdapter(BasePlatformAdapter):
                             d = json.loads(line[5:].strip())
                         except Exception:
                             continue
-                        # Only handle mentions from the space this gateway was
-                        # launched for. The aX SSE stream can still deliver
-                        # mentions from spaces where the identity remains a
-                        # member; without this guard, a moved agent can answer in
-                        # its old/home space even while connected to a new space.
+                        # Only handle mentions from a space this gateway actually
+                        # subscribed to. The aX SSE stream can be token-scoped and
+                        # may deliver cross-space events; the subscribed-space set
+                        # is the explicit wake contract for this gateway process.
                         if not self._event_space_matches(d):
                             continue
                         # R3: never react to our own posts (echo-loop guard).
@@ -283,7 +443,7 @@ class AXAdapter(BasePlatformAdapter):
             except Exception as e:
                 if not self._running:
                     break
-                logger.warning("aX: SSE dropped (%r) — reconnect in %.0fs", e, backoff)
+                logger.warning("aX: SSE for space %s dropped (%r) — reconnect in %.0fs", reader_space, e, backoff)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
@@ -328,24 +488,23 @@ class AXAdapter(BasePlatformAdapter):
         return bool(cls._NO_REPLY_OUTPUT_RE.search(str(content or "")))
 
     def _event_space_matches(self, d: dict) -> bool:
-        """True when an SSE mention belongs to this gateway's configured space.
+        """True when an SSE mention belongs to one of this gateway's subscriptions.
 
-        Some aX streams can deliver mention events for any space where the agent
-        identity remains addressable. A moved gateway must not answer old/home
-        space mentions after it has been launched with a destination AX_SPACE_ID.
-        Missing space_id is allowed for backwards-compatible event shapes.
+        Reject events that carry an explicit space_id outside the discovered
+        subscription set. Missing space_id remains allowed for backwards-
+        compatible event shapes.
         """
         event_space = d.get("space_id")
         if not event_space:
             return True
-        expected = str(self.space_id or "")
-        if not expected:
-            return True
-        if str(event_space) == expected:
+        expected = {str(s) for s in getattr(self, "_subscribed_spaces", set()) if s}
+        if not expected and self.space_id:
+            expected = {str(self.space_id)}
+        if not expected or str(event_space) in expected:
             return True
         logger.info(
-            "aX: ignored mention %s for space %s while connected to %s",
-            d.get("id"), event_space, expected,
+            "aX: ignored mention %s for unsubscribed space %s; subscribed=%s",
+            d.get("id"), event_space, sorted(expected),
         )
         return False
 
@@ -458,11 +617,31 @@ class AXAdapter(BasePlatformAdapter):
                 logger.debug("aX: sender-name resolve failed for %s: %r", mid, e)
         return str(sid or "someone")
 
+    _LEADING_MENTION_COMMAND_RE = re.compile(
+        r"^\s*(?:@[A-Za-z0-9_.-]+\s*(?:[:,;\u2014\u2013-]\s*)?)+(?=/[A-Za-z0-9])"
+    )
+
+    @classmethod
+    def _normalize_inbound_text(cls, content: str) -> str:
+        """Normalize aX mention text before handing it to Hermes.
+
+        aX routes agent input by @mention, so users naturally write
+        ``@peach /commands``. Hermes gateway slash dispatch only recognizes
+        commands when the normalized MessageEvent text starts with ``/``;
+        without this strip the command falls through to the model as plain chat.
+        Strip only leading @handle prefixes immediately followed by a slash so
+        ordinary mentions and prose remain untouched.
+        """
+        text = str(content or "")
+        return cls._LEADING_MENTION_COMMAND_RE.sub("", text, count=1)
+
     def _dispatch(self, d: dict) -> None:
         """Build a MessageEvent from an aX mention and schedule handle_message."""
         mid = d.get("id")
         chat_id = d.get("space_id") or self.space_id
         self._last_mid[chat_id] = mid
+        if mid and d.get("channel"):
+            self._message_channels[str(mid)] = str(d.get("channel"))
         who = self._resolve_sender_name(d)
         # Move/create proof needs a grep-able stdout line for the exact
         # destination-space mention. Do not rely only on logger config; the tmux
@@ -490,7 +669,7 @@ class AXAdapter(BasePlatformAdapter):
             message_id=mid,
         )
         event = MessageEvent(
-            text=d.get("content") or "",
+            text=self._normalize_inbound_text(d.get("content") or ""),
             message_type=MessageType.TEXT,
             source=source,
             message_id=mid,
@@ -591,6 +770,128 @@ class AXAdapter(BasePlatformAdapter):
             logger.warning("aX: recovery list failed for sent message in %s: %r", space_id, e)
         return None
 
+    def _fetch_parent_channel(self, parent_id: str, space_id: str) -> Optional[str]:
+        """Read the parent message channel when the SSE wake payload omitted it."""
+        try:
+            import json as _json
+            import urllib.request
+
+            token = self._access_token_for_space(space_id)
+            req = urllib.request.Request(
+                f"{ax.MESSAGES_URL}/{parent_id}",
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Accept": "application/json",
+                    "X-Agent-Id": self.agent_id,
+                    "X-Space-Id": space_id,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read()
+                ctype = r.headers.get("content-type", "")
+            if "json" not in ctype.lower():
+                logger.warning(
+                    "aX: parent channel lookup returned non-JSON content-type %s for parent %s in space %s",
+                    ctype,
+                    parent_id,
+                    space_id,
+                )
+                return None
+            data = _json.loads(raw.decode() if raw else "{}")
+            msg = data.get("message") or data
+            channel = msg.get("channel")
+            if channel:
+                return str(channel)
+        except Exception as e:
+            logger.warning("aX: parent channel lookup failed for %s in %s: %r", parent_id, space_id, e)
+        return None
+
+    def _channel_for_parent(self, parent_id: Optional[str], space_id: str) -> str:
+        """Return the aX channel a threaded reply must use for its parent."""
+        if not parent_id:
+            return "main"
+        if not hasattr(self, "_message_channels"):
+            self._message_channels = {}
+        parent_key = str(parent_id)
+        cached = self._message_channels.get(parent_key)
+        if cached:
+            return cached
+        fetched = self._fetch_parent_channel(parent_key, space_id)
+        if fetched:
+            self._message_channels[parent_key] = fetched
+            return fetched
+        return "main"
+
+    @staticmethod
+    def _trim_for_log(value: Any, limit: int = 500) -> str:
+        text = str(value or "")
+        text = re.sub(r"[\r\n\t]+", " ", text).strip()
+        return text[:limit]
+
+    @classmethod
+    def _classify_post_failure(cls, status: Optional[int], body: str, parent_id: Optional[str]) -> str:
+        body_l = body.lower()
+        if status == 400 and parent_id and any(s in body_l for s in ("reminder", "activity", "card_only")):
+            return "reply_to_activity_or_reminder_parent"
+        if status in (401, 403) or any(s in body_l for s in ("unauthorized", "forbidden", "token", "scope")):
+            return "auth_or_scope"
+        if status == 400 and any(s in body_l for s in ("parent", "thread")):
+            return "parent_thread_contract"
+        if status == 400 and any(s in body_l for s in ("agent", "sender", "identity")):
+            return "agent_identity_contract"
+        if status == 400:
+            return "bad_request_unknown_contract"
+        return "unknown"
+
+    def _log_post_failure(self, exc: Exception, payload: Dict[str, Any], space_id: str,
+                          parent_id: Optional[str]) -> None:
+        """Log enough context to diagnose aX post-contract failures without secrets."""
+        status = getattr(exc, "code", None) or getattr(exc, "status", None)
+        reason = getattr(exc, "reason", None) or getattr(exc, "msg", None)
+        headers = getattr(exc, "headers", None)
+        ctype = ""
+        if headers is not None:
+            try:
+                ctype = headers.get("content-type", "") or headers.get("Content-Type", "")
+            except Exception:
+                ctype = ""
+        raw_body = b""
+        try:
+            if hasattr(exc, "read"):
+                raw_body = exc.read() or b""
+        except Exception:
+            raw_body = b""
+        if isinstance(raw_body, bytes):
+            body = raw_body.decode("utf-8", "replace")
+        else:
+            body = str(raw_body or "")
+        body_preview = self._trim_for_log(body)
+        content = str(payload.get("content") or "")
+        content_sha = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:12]
+        classification = self._classify_post_failure(
+            int(status) if isinstance(status, int) else None,
+            body_preview,
+            parent_id,
+        )
+        logger.warning(
+            "aX: post failed handle=@%s agent_id=%s space=%s parent=%s status=%s reason=%r "
+            "content_type=%r payload_channel=%s payload_type=%s content_len=%d content_sha=%s "
+            "classification=%s response_body=%r",
+            getattr(self, "handle", ""),
+            getattr(self, "agent_id", ""),
+            space_id,
+            parent_id or "",
+            status,
+            reason,
+            ctype,
+            payload.get("channel"),
+            payload.get("message_type"),
+            len(content),
+            content_sha,
+            classification,
+            body_preview,
+        )
+
     def _post_message(self, content: str, parent_id: Optional[str], space_id: str) -> Optional[str]:
         """Blocking final-reply POST as the configured agent into the destination space."""
         import json as _json
@@ -599,7 +900,7 @@ class AXAdapter(BasePlatformAdapter):
         payload = {
             "content": content,
             "space_id": space_id,
-            "channel": "main",
+            "channel": self._channel_for_parent(parent_id, space_id),
             "message_type": "text",
         }
         if parent_id:
@@ -690,7 +991,7 @@ class AXAdapter(BasePlatformAdapter):
                 return None
             return str(mid)
         except Exception as e:
-            logger.warning("aX: post failed for space %s: %r", space_id, e)
+            self._log_post_failure(e, payload, space_id, parent_id)
             return None
 
     async def send_or_update_status(self, chat_id: str, status_key: str, content: str,
@@ -742,16 +1043,17 @@ class AXAdapter(BasePlatformAdapter):
         if self._looks_like_progress(content):
             await loop.run_in_executor(None, self._post_activity, chat_id, content, metadata)
             return SendResult(success=True, message_id="activity")
+        parent_id = reply_to or self._message_id_from_metadata(chat_id, metadata)
         try:
             mid = await loop.run_in_executor(
-                None, lambda: self._post_message(content, reply_to, chat_id)
+                None, lambda: self._post_message(content, parent_id, chat_id)
             )
         except Exception as e:
             return SendResult(success=False, error=str(e), retryable=True)
         if not mid:
             return SendResult(success=False, error="aX post failed", retryable=True)
         print(
-            f"aX send delivered: handle=@{getattr(self, 'handle', '')} space={chat_id} reply_msg={mid} parent={reply_to or self._message_id_from_metadata(chat_id, metadata) or ''}",
+            f"aX send delivered: handle=@{getattr(self, 'handle', '')} space={chat_id} reply_msg={mid} parent={parent_id or ''}",
             flush=True,
         )
         return SendResult(success=True, message_id=str(mid))
@@ -876,30 +1178,65 @@ class AXAdapter(BasePlatformAdapter):
 
 # ── Plugin registration ──────────────────────────────────────────────────────────
 def check_requirements() -> bool:
-    """aX is configured if we have a handle + space + an existing token file."""
+    """aX is configured if we have a handle + an existing token file."""
     tok = os.path.expanduser(os.getenv("AX_TOKEN_FILE", ""))
-    return bool(os.getenv("AX_AGENT_HANDLE") and os.getenv("AX_SPACE_ID") and tok and os.path.exists(tok))
+    return bool(os.getenv("AX_AGENT_HANDLE") and tok and os.path.exists(tok))
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    return bool((os.getenv("AX_AGENT_HANDLE") or extra.get("handle"))
-                and (os.getenv("AX_SPACE_ID") or extra.get("space_id")))
+    return bool(os.getenv("AX_AGENT_HANDLE") or extra.get("handle"))
+
+
+def _derive_env_agent_space_id(agent_id: str = "") -> str:
+    """Best-effort config-load space lookup for env-only gateway startup."""
+    try:
+        import json as _json
+        import urllib.request
+
+        token = ax.current_access_token()
+        paths = []
+        if agent_id:
+            paths.append(f"/api/v1/agents/{agent_id}")
+        paths.append("/api/v1/agents/me")
+        for path in paths:
+            req = urllib.request.Request(
+                f"{ax.BASE}{path}",
+                headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read()
+            data = _json.loads(raw.decode() if raw else "{}")
+            agent = data.get("agent") if isinstance(data, dict) else None
+            if isinstance(agent, dict):
+                data = agent
+            space = data.get("space_id") if isinstance(data, dict) else None
+            if space:
+                return str(space)
+    except Exception as exc:
+        logger.debug("aX env enablement space lookup failed: %s", exc)
+    return ""
 
 
 def _env_enablement() -> Optional[dict]:
     """Seed PlatformConfig.extra from env so env-only setups show up in
-    `hermes gateway status` without instantiating the adapter."""
+    `hermes gateway status` without instantiating the adapter.
+
+    Launch env identifies the agent, not its space. The home channel is derived
+    from the backend agent record before the first inbound turn, so Hermes does
+    not emit a spurious /sethome prompt while the adapter is still connecting.
+    """
     handle = os.getenv("AX_AGENT_HANDLE", "").strip()
-    space = os.getenv("AX_SPACE_ID", "").strip()
     token = os.getenv("AX_TOKEN_FILE", "").strip()
-    if not (handle and space and token):
+    agent_id = os.getenv("AX_AGENT_ID", "").strip()
+    if not (handle and token):
         return None
-    seed = {"handle": handle, "space_id": space, "token_file": token,
-            "agent_id": os.getenv("AX_AGENT_ID", "").strip()}
-    home = os.getenv("AX_HOME_SPACE") or space
-    if home:
-        seed["home_channel"] = {"chat_id": home, "name": "aX home space"}
+    seed = {"handle": handle, "token_file": token, "agent_id": agent_id}
+    space = _derive_env_agent_space_id(agent_id)
+    if space:
+        seed["space_id"] = space
+        seed["home_space"] = space
+        seed["home_channel"] = {"chat_id": space, "name": "aX home space"}
     return seed
 
 
@@ -968,9 +1305,11 @@ def register(ctx):
         check_fn=check_requirements,
         validate_config=validate_config,
         env_enablement_fn=_env_enablement,
-        required_env=["AX_AGENT_HANDLE", "AX_SPACE_ID", "AX_TOKEN_FILE"],
+        required_env=["AX_AGENT_HANDLE", "AX_TOKEN_FILE"],
         install_hint="No extra packages (stdlib only); needs ax_presence_listener.py on AX_PRESENCE_DIR",
-        cron_deliver_env_var="AX_HOME_SPACE",
+        # aX does not accept a static home-space env fallback: default/home
+        # routing is seeded by _env_enablement() from the backend agent record.
+        cron_deliver_env_var="",
         standalone_sender_fn=_standalone_send,
         allowed_users_env="AX_ALLOWED_USERS",
         allow_all_env="AX_ALLOW_ALL_USERS",
