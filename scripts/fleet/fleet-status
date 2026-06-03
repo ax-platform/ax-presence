@@ -3,21 +3,34 @@
 
 Combines THREE views, because no single one tells the truth:
   1. PLATFORM  (aX agents API, one call)  -> who the team is, control/kill-switch,
-                                              sse_connected, routable
+                                              sse_connected, routable, and SPACE
   2. LOCAL     (/proc + ss)               -> is the gateway process actually up,
                                               how many live :443 sockets
   3. RECEIPT   (logs/agent.log)           -> when did it LAST actually receive an
                                               inbound mention  <-- the deaf detector
+                                              (read from the agent's OWN log, so it
+                                              is space-correct regardless of space)
 
 "Good" = process up + token valid + platform routable + received inbound recently.
-The dangerous state this catches: platform says sse_connected=True and the process
-is up, but no inbound has arrived in a long time -> SSE reader has gone DEAF.
-(Gold-standard confirmation is an active round-trip probe; see --probe, TODO.)
+
+SPACE-AWARE: agents are GROUPED BY SPACE so cross-space agents are never confused
+for broken. An agent in a different space than peach's home will not answer a
+peach-originated probe (peach isn't a member there) — that is NOT deaf, just
+elsewhere. Its liveness is judged from its own log receipt, and the row is shown
+under its own space header.
 """
-import json, os, subprocess, time, glob, sys
+import json, os, subprocess, time, sys
 
 DEAF_AFTER_S = 30 * 60          # no inbound in 30m while "connected" => suspect deaf
-HERE = "/home/ax-agents"
+
+# ── Config (env-overridable so another operator can point this at their box) ──
+#   AX_FLEET_HOME      base dir holding agent homes        (default /home/ax-agents)
+#   AX_FLEET_MCP       command to run aX MCP calls AS the fleet identity
+#                      (default <HOME>/peach/bin/ax-peach)
+#   AX_FLEET_IDENTITY  the probing agent's handle, anchors "my home space"
+HERE     = os.environ.get("AX_FLEET_HOME", "/home/ax-agents")
+IDENTITY = os.environ.get("AX_FLEET_IDENTITY", "peach")
+MCP      = os.environ.get("AX_FLEET_MCP", f"{HERE}/{IDENTITY}/bin/ax-peach")
 
 def sh(cmd):
     try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout
@@ -26,7 +39,7 @@ def sh(cmd):
 def platform_agents():
     # write to a temp file (large response truncates through a pipe at ~64KB)
     tmp = "/tmp/fleet_agents.json"
-    sh(f"{HERE}/peach/bin/ax-peach agents action=list view_scope=all --output json 2>/dev/null > {tmp}")
+    sh(f"{MCP} agents action=list view_scope=all --output json 2>/dev/null > {tmp}")
     try: items = json.load(open(tmp))["data"]["items"]
     except Exception as e:
         print(f"(platform fetch failed: {e})", file=sys.stderr); return {}
@@ -49,12 +62,25 @@ def local_gateways():
         res[h] = {"pid": pid, "home": e.get("HERMES_HOME", ""), "conns": conns}
     return res
 
-def last_inbound_age(home):
-    log = os.path.join(home or "", "logs", "agent.log")
-    if not home or not os.path.exists(log):
+def agent_log(handle, home):
+    """Resolve the agent's log: profile agents (-p <h>) log under profiles/<h>/logs."""
+    if home:
+        prof = os.path.join(home, "profiles", handle, "logs", "agent.log")
+        if os.path.exists(prof):
+            return prof
+        base = os.path.join(home, "logs", "agent.log")
+        if os.path.exists(base):
+            return base
+    return None
+
+def last_inbound_age(log):
+    if not log or not os.path.exists(log):
         return None
-    # tail-scan for the last inbound line (cheap-ish)
-    last = sh(f"grep -hE 'inbound message: platform=ax' {log} {log}.1 2>/dev/null | tail -1")
+    # Receipt = either the per-agent dispatch line or the gateway inbound line.
+    # Grep rotated (.1, older) FIRST then the current log, so `tail -1` is the
+    # genuinely newest match (not the last line of the older rotated file).
+    pat = "aX inbound dispatch|inbound message: platform=ax"
+    last = sh(f"grep -hE '{pat}' {log}.1 {log} 2>/dev/null | tail -1")
     if not last:
         return None
     ts = last[:19]
@@ -70,33 +96,68 @@ def fmt_age(s):
     if s < 5400: return f"{s//60}m"
     return f"{s//3600}h"
 
+def short(uuid):
+    return (uuid or "")[:8] or "—"
+
 def main():
     plat = platform_agents()
     loc = local_gateways()
     # the team = anything cli OR running locally
     team = sorted(set(loc) | {n for n,a in plat.items() if a.get("connection_type")=="cli"})
-    print(f"FLEET — {time.strftime('%Y-%m-%d %H:%M:%S')}   (platform agents seen: {len(plat)}, local gateways: {len(loc)})\n")
-    print(f"{'HANDLE':11}{'VERDICT':14}{'PID':8}{'CONN':6}{'PLAT_SSE':9}{'CTRL':9}{'LAST_INBOUND':13}")
+
+    # the fleet identity's home space anchors "is this agent in my space?"
+    peach_space = (plat.get(IDENTITY) or {}).get("space_id")
+
+    # bucket the team by space_id
+    by_space = {}
     for h in team:
         a = plat.get(h, {})
-        l = loc.get(h)
-        ctrl = (a.get("control") or {}).get("state", "?")
-        sse = a.get("sse_connected")
-        age = last_inbound_age(l["home"]) if l else None
-        # verdict
-        if ctrl == "disabled":
-            v = "DISABLED"
-        elif not l:
-            v = "elsewhere" if a.get("connection_type")=="cli" else "down(local)"
-        elif age is not None and age > DEAF_AFTER_S and sse:
-            v = "⚠ SUSPECT-DEAF"
-        elif age is not None and age <= DEAF_AFTER_S:
-            v = "✓ OK"
-        else:
-            v = "? unknown"
-        print(f"{h:11}{v:14}{(l['pid'] if l else '-'):8}{(l['conns'] if l else '-'):6}"
-              f"{str(sse):9}{str(ctrl):9}{fmt_age(age):13}")
-    print("\nlegend: ✓OK=received inbound <30m | ⚠SUSPECT-DEAF=up+sse but silent >30m (confirm w/ round-trip) | elsewhere=cli agent not on this box")
+        sid = a.get("space_id") or "unknown"
+        by_space.setdefault(sid, []).append(h)
+
+    print(f"FLEET — {time.strftime('%Y-%m-%d %H:%M:%S')}   "
+          f"(platform agents seen: {len(plat)}, local gateways: {len(loc)})")
+    if peach_space:
+        pname = (plat.get(IDENTITY) or {}).get('space_name') or short(peach_space)
+        print(f"probing identity: @{IDENTITY}  home space: {pname} ({short(peach_space)})")
+    print()
+
+    # home space first, then the rest
+    order = sorted(by_space, key=lambda s: (s != peach_space, s))
+    for sid in order:
+        handles = sorted(by_space[sid])
+        # space name from any agent in it
+        sname = next((plat[h].get("space_name") for h in handles if plat.get(h, {}).get("space_name")), None) or short(sid)
+        tag = f"  ← {IDENTITY} home" if sid == peach_space else "  ← other space"
+        print(f"SPACE  {sname}  ({short(sid)}){tag}")
+        print(f"  {'HANDLE':11}{'VERDICT':16}{'PID':8}{'CONN':6}{'PLAT_SSE':9}{'CTRL':9}{'LAST_INBOUND':13}")
+        for h in handles:
+            a = plat.get(h, {})
+            l = loc.get(h)
+            ctrl = (a.get("control") or {}).get("state", "?")
+            sse = a.get("sse_connected")
+            age = last_inbound_age(agent_log(h, l["home"])) if l else None
+            # Uniform liveness: own-log receipt is space-correct for EVERY agent,
+            # so cross-space agents are judged (and healed) the same as home-space
+            # ones. Space grouping above is for visibility, not a different verdict.
+            if ctrl == "disabled":
+                v = "DISABLED"
+            elif not l:
+                v = "elsewhere" if a.get("connection_type") == "cli" else "down(local)"
+            elif age is not None and age <= DEAF_AFTER_S:
+                v = "✓ OK"
+            elif sse:
+                v = "⚠ SUSPECT-DEAF"
+            else:
+                v = "? unknown"
+            print(f"  {h:11}{v:16}{(l['pid'] if l else '-'):8}{(l['conns'] if l else '-'):6}"
+                  f"{str(sse):9}{str(ctrl):9}{fmt_age(age):13}")
+        print()
+
+    print("legend: ✓OK=received inbound <30m (own-log receipt, space-correct) | "
+          "⚠SUSPECT-DEAF=up+sse but silent >30m, any space → bounce candidate | "
+          "elsewhere=cli agent not on this box | DISABLED=kill-switch")
+    print("note: agents are grouped by space for visibility; liveness is judged the SAME in every space.")
 
 if __name__ == "__main__":
     main()

@@ -19,8 +19,15 @@ Verdicts:
 """
 import json, os, re, subprocess, sys, time
 
-HERE = "/home/ax-agents"
-BOUNCE_LOG = f"{HERE}/peach/logs/fleet-bounces.log"
+# ── Config (env-overridable so another operator can point this at their box) ──
+#   AX_FLEET_HOME      base dir holding agent homes        (default /home/ax-agents)
+#   AX_FLEET_MCP       command to run aX MCP calls AS the fleet identity
+#                      (default <HOME>/<IDENTITY>/bin/ax-peach)
+#   AX_FLEET_IDENTITY  the probing agent's handle (anchors "my home space" + logs)
+HERE     = os.environ.get("AX_FLEET_HOME", "/home/ax-agents")
+IDENTITY = os.environ.get("AX_FLEET_IDENTITY", "peach")
+MCP      = os.environ.get("AX_FLEET_MCP", f"{HERE}/{IDENTITY}/bin/ax-peach")
+BOUNCE_LOG = os.environ.get("AX_FLEET_BOUNCE_LOG", f"{HERE}/{IDENTITY}/logs/fleet-bounces.log")
 DEAF_AFTER_S = 30*60
 APPLY  = "--apply"  in sys.argv      # actually perform bounces
 BOUNCE = "--bounce" in sys.argv      # consider bouncing (dry-run unless --apply)
@@ -32,7 +39,7 @@ def sh(cmd, t=40):
     except Exception: return ""
 
 def platform_agents():
-    sh(f"{HERE}/peach/bin/ax-peach agents action=list view_scope=all --output json 2>/dev/null > /tmp/fd_agents.json")
+    sh(f"{MCP} agents action=list view_scope=all --output json 2>/dev/null > /tmp/fd_agents.json")
     try: return {a["name"]: a for a in json.load(open("/tmp/fd_agents.json"))["data"]["items"] if a.get("name")}
     except Exception: return {}
 
@@ -56,7 +63,10 @@ def local_gateways():
 
 def last_inbound_age(log):
     if not log or not os.path.exists(log): return None
-    last = sh(f"grep -hE 'inbound message: platform=ax' {log} {log}.1 2>/dev/null | tail -1")
+    # Receipt = per-agent dispatch OR gateway inbound line. Grep rotated (.1,
+    # older) first then current, so tail -1 is the genuinely newest match.
+    pat = "aX inbound dispatch|inbound message: platform=ax"
+    last = sh(f"grep -hE '{pat}' {log}.1 {log} 2>/dev/null | tail -1")
     if not last: return None
     try: return int(time.time() - time.mktime(time.strptime(last[:19], "%Y-%m-%d %H:%M:%S")))
     except Exception: return None
@@ -88,7 +98,7 @@ def probe(targets, gws):
     nonce = "fd"+str(int(time.time()))[-6:]
     for h in targets:
         msg = f'@{h} fleet-doctor probe {nonce} — automated SSE liveness check from @peach.'
-        sh(f'{HERE}/peach/bin/ax-peach messages action=send content={json.dumps(msg)} bypass=true >/dev/null 2>&1')
+        sh(f'{MCP} messages action=send content={json.dumps(msg)} bypass=true >/dev/null 2>&1')
     time.sleep(45)
     alive = set()
     for h in targets:
@@ -113,9 +123,16 @@ def main():
     gws  = local_gateways()
     team = sorted(set(gws) | {n for n,a in plat.items() if a.get("connection_type")=="cli"})
 
-    # pre-classify to decide who to probe (process up + not disabled + locally present)
+    # peach's home space — the only space peach can actively probe into (the
+    # platform refuses cross-space sends to prevent leakage). Cross-space agents
+    # are confirmed by their OWN-LOG receipt instead, with the SAME deaf rule.
+    peach_space = str((plat.get(IDENTITY) or {}).get("space_id") or "")
+
+    # pre-classify to decide who to probe (process up + not disabled + local).
     pending = [h for h in team if h in gws and (plat.get(h,{}).get("control") or {}).get("state")!="disabled"]
-    alive = probe(pending, gws) if (PROBE and pending) else None
+    # Only probe agents in peach's own space; cross-space sends are refused.
+    probe_targets = [h for h in pending if str(plat.get(h,{}).get("space_id") or "") == peach_space]
+    alive = probe(probe_targets, gws) if (PROBE and probe_targets) else None
 
     rows, problems = [], []
     for h in team:
@@ -123,8 +140,11 @@ def main():
         ctrl = (a.get("control") or {}).get("state")
         sse  = a.get("sse_connected")
         db_space   = str(a.get("space_id") or "")
+        sname = a.get("space_name") or (db_space[:8] if db_space else "?")
+        cross = bool(db_space and peach_space and db_space != peach_space)
         live_space = live_home_space(g["log"]) if g else None
         age  = last_inbound_age(g["log"]) if g else None
+        recent = age is not None and age <= DEAF_AFTER_S
         why = remedy = ""
         if ctrl == "disabled":
             v, why = "DISABLED", "kill-switch (intentional)"; remedy="leave (enable to restore)"
@@ -135,28 +155,39 @@ def main():
             v = "MOVED"; why = f"placement changed: DB={db_space[:8]} != live={live_space[:8]} (connection stale on old space)"; remedy="bounce (reconnect to assigned space)"
         elif g and saw_no_home(g["log"]):
             v, why = "NO_HOME", "home-space derive failed (no home channel)"; remedy="ensure AX_AGENT_ID+token; re-derive"
-        elif alive is not None and h in pending:
+        elif alive is not None and h in probe_targets:
+            # Same-space: probe is the authoritative confirmation.
             if h in alive:
-                v = "OK" if (age is not None and age<=DEAF_AFTER_S) else "QUIET"
+                v = "OK" if recent else "QUIET"
                 why = "probe received" + ("" if v=="OK" else "; no organic traffic")
             else:
-                v, why = "DEAF", "process up + sse_connected but probe NOT received (SSE reader stalled)"; remedy="bounce"
+                v, why = "DEAF", "up + sse_connected but probe NOT received (SSE reader stalled)"; remedy="bounce"
+        elif cross:
+            # Cross-space: peach can't probe; confirm by OWN-LOG receipt, SAME deaf
+            # rule (up+sse+no recent receipt -> bounce). Treated like home-space.
+            if recent:
+                v, why = "OK", f"cross-space [{sname}]: own-log receipt recent"
+            elif sse:
+                v, why = "DEAF", f"cross-space [{sname}]: up + sse_connected, no recent receipt (peach can't probe other spaces)"; remedy="bounce"
+            else:
+                v, why = "? (no probe)", f"cross-space [{sname}]: not sse_connected"
         else:
-            v = "OK" if (age is not None and age<=DEAF_AFTER_S) else "? (no probe)"
+            v = "OK" if recent else "? (no probe)"
         tok = token_state(g["home"], h) if g else None
         if tok is not None and tok < 0 and v not in ("DISABLED",):
             why += " | token EXPIRED"
-        rows.append((h, v, (g['pid'] if g else '-'), str(sse), str(ctrl), why, remedy))
+        rows.append((h, v, (g['pid'] if g else '-'), str(sse), str(ctrl), sname, why, remedy))
         if v in ("DEAF","DOWN","NO_HOME","MOVED"): problems.append((h, v, g))
 
-    print(f"FLEET-DOCTOR — {time.strftime('%F %T')}  (platform:{len(plat)} local:{len(gws)} probed:{len(pending) if alive is not None else 0})\n")
-    print(f"{'HANDLE':10}{'VERDICT':10}{'PID':8}{'SSE':6}{'CTRL':9}WHY")
-    for h,v,pid,sse,ctrl,why,rem in rows:
-        print(f"{h:10}{v:10}{str(pid):8}{sse:6}{ctrl:9}{why}")
+    print(f"FLEET-DOCTOR — {time.strftime('%F %T')}  (platform:{len(plat)} local:{len(gws)} probed:{len(probe_targets) if alive is not None else 0})")
+    print(f"probing identity @peach home space: {(plat.get('peach') or {}).get('space_name') or peach_space[:8]}\n")
+    print(f"{'HANDLE':10}{'VERDICT':10}{'PID':8}{'SSE':6}{'CTRL':9}{'SPACE':22}WHY")
+    for h,v,pid,sse,ctrl,sname,why,rem in rows:
+        print(f"{h:10}{v:10}{str(pid):8}{sse:6}{ctrl:9}{sname[:21]:22}{why}")
     if problems:
         print("\nPROBLEMS & REMEDY:")
         for h,v,g in problems:
-            rem = next(r[6] for r in rows if r[0]==h)
+            rem = next(r[7] for r in rows if r[0]==h)
             print(f"  {h}: {v} -> {rem}")
             if BOUNCE and v in ("DEAF","MOVED") and g:
                 bounce(h, g)
@@ -165,7 +196,7 @@ def main():
 
     if ALERT and problems:
         summary = "fleet-doctor alert: " + ", ".join(f"{h}={v}" for h,v,_ in problems)
-        sh(f'{HERE}/peach/bin/ax-peach messages action=send content={json.dumps(summary)} >/dev/null 2>&1')
+        sh(f'{MCP} messages action=send content={json.dumps(summary)} >/dev/null 2>&1')
         print(f"\nalerted: {summary}")
 
 if __name__ == "__main__":

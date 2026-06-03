@@ -11,12 +11,21 @@ Usage: fleet-probe [handle ...]   (default: all local hermes gateways)
 """
 import json, os, subprocess, sys, time
 
-HERE = "/home/ax-agents"
+# env-overridable so another operator can point this at their box / identity
+HERE     = os.environ.get("AX_FLEET_HOME", "/home/ax-agents")
+IDENTITY = os.environ.get("AX_FLEET_IDENTITY", "peach")
+MCP      = os.environ.get("AX_FLEET_MCP", f"{HERE}/{IDENTITY}/bin/ax-peach")
 WAIT = 45  # seconds to allow receipt + (possibly slow) reply
 
 def sh(cmd, t=30):
     try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t).stdout
     except Exception: return ""
+
+def agent_log(handle, home):
+    # -p <profile> agents log under profiles/<h>/logs even though HERMES_HOME is shared
+    for p in (f"{home}/profiles/{handle}/logs/agent.log", f"{home}/logs/agent.log"):
+        if os.path.exists(p): return p
+    return f"{home}/logs/agent.log"
 
 def local_gateways():
     res = {}
@@ -37,22 +46,22 @@ def main():
     print(f"probe nonce={nonce}  targets={targets}\n")
     t0 = time.time()
     for h in targets:
-        msg = f'@{h} fleet health probe {nonce} — automated SSE check from @peach, please reply "ack {nonce}".'
-        sh(f'{HERE}/peach/bin/ax-peach messages action=send content={json.dumps(msg)} bypass=true >/dev/null 2>&1')
+        msg = f'@{h} fleet health probe {nonce} — automated SSE check from @{IDENTITY}, please reply "ack {nonce}".'
+        sh(f'{MCP} messages action=send content={json.dumps(msg)} bypass=true >/dev/null 2>&1')
         print(f"  sent -> @{h}")
     print(f"\nwaiting {WAIT}s for receipt/reply...\n")
     time.sleep(WAIT)
 
-    # check replies into peach inbox once
-    sh(f'{HERE}/peach/bin/ax-peach messages action=check limit=40 --output json >/tmp/peach_inbox.json 2>/dev/null')
+    # check replies into the fleet identity's inbox once
+    sh(f'{MCP} messages action=check limit=40 --output json >/tmp/peach_inbox.json 2>/dev/null')
     inbox = ""
     try: inbox = json.dumps(json.load(open("/tmp/peach_inbox.json")))
     except Exception: pass
 
     print(f"{'HANDLE':11}{'RECEIVED':10}{'REPLIED':9}VERDICT")
     for h in targets:
-        log = os.path.join(gws[h], "logs", "agent.log")
-        got = sh(f"grep -hF '{nonce}' {log} {log}.1 2>/dev/null | grep -c 'inbound message'").strip()
+        log = agent_log(h, gws[h])
+        got = sh(f"grep -hF '{nonce}' {log} {log}.1 2>/dev/null | grep -cE 'inbound message|aX inbound dispatch'").strip()
         received = got not in ("", "0")
         replied = (nonce in inbox and "ack" in inbox.lower())
         verdict = "✓ ALIVE" if received else "✗ DEAF (SSE not delivering)"
