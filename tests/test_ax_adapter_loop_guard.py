@@ -315,7 +315,7 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
     def test_connect_starts_sse_readers_for_all_discovered_spaces(self):
         calls = []
 
-        def record_reader(space_id=None):
+        def record_reader(space_id=None, my_epoch=None):
             calls.append(space_id)
 
         async def run():
