@@ -109,6 +109,18 @@ class AXAdapter(BasePlatformAdapter):
         # authoritative backend agent-record space; membership in other spaces is
         # not routing authority and must not wake the agent there.
         self._subscribed_spaces: set[str] = set()
+        # Live-move support (agent_placement_changed SSE control event):
+        # _reader_epoch is the per-generation stop signal for SSE reader threads.
+        # When placement changes we bump it, tear down the old readers (they
+        # self-terminate on their next line), re-resolve the DB space, and spawn
+        # a fresh generation. _running stays the global lifecycle flag (it must
+        # NOT be used for teardown or it would also stop heartbeat/refresh and
+        # block respawn). The single-flight lock + flag guarantee exactly one
+        # reader performs the teardown/respawn even though every subscribed
+        # reader receives the broadcast.
+        self._reader_epoch: int = 0
+        self._resub_lock = threading.Lock()
+        self._resubscribing = False
 
     @property
     def name(self) -> str:
@@ -204,22 +216,32 @@ class AXAdapter(BasePlatformAdapter):
             None, self._discover_subscribed_spaces
         )
         self._subscribed_spaces = set(subscribed_spaces)
+        self._spawn_readers(subscribed_spaces)
+
+        self._mark_connected()
+        logger.info("aX: connected as @%s on home space %s; subscribed spaces=%s",
+                    self.handle, self.space_id, sorted(self._subscribed_spaces))
+        return True
+
+    def _spawn_readers(self, spaces: List[str]) -> None:
+        """Spawn one SSE reader thread per space for the CURRENT epoch.
+
+        Each reader captures the epoch live at start; a later epoch bump makes
+        the old generation self-terminate on its next SSE line. Used by both the
+        initial connect() and the live-move re-subscribe path.
+        """
+        epoch = self._reader_epoch
         self._reader_threads = []
-        for sid in subscribed_spaces:
+        for sid in spaces:
             t = threading.Thread(
                 target=self._sse_reader,
-                args=(sid,),
+                args=(sid, epoch),
                 name=f"ax-sse-{sid[:8]}",
                 daemon=True,
             )
             t.start()
             self._reader_threads.append(t)
         self._reader_thread = self._reader_threads[0] if self._reader_threads else None
-
-        self._mark_connected()
-        logger.info("aX: connected as @%s on home space %s; subscribed spaces=%s",
-                    self.handle, self.space_id, sorted(self._subscribed_spaces))
-        return True
 
     def _derive_agent_space_id(self) -> str:
         """Read the authoritative aX placement from the agent record.
@@ -382,15 +404,24 @@ class AXAdapter(BasePlatformAdapter):
         return base_token
 
     # ── Inbound: blocking SSE reader bridged to asyncio ──────────────────────────
-    def _sse_reader(self, space_id: Optional[str] = None) -> None:
+    def _sse_reader(self, space_id: Optional[str] = None, my_epoch: Optional[int] = None) -> None:
         """Reuse the listener's SSE shape, but dispatch each @mention into the
         gateway via run_coroutine_threadsafe instead of printing a NOTIFY line.
-        Reconnects with capped backoff while self._running."""
+        Reconnects with capped backoff while self._running.
+
+        my_epoch identifies this reader's generation. When placement changes the
+        adapter bumps self._reader_epoch and respawns readers; an old-generation
+        reader self-terminates on its next SSE line (the epoch check below). This
+        is independent of self._running, which stays the global lifecycle flag."""
         import json
         import urllib.request
         reader_space = str(space_id or self.space_id or "")
+        if my_epoch is None:
+            my_epoch = self._reader_epoch
         backoff = 1.0
         while self._running:
+            if getattr(self, "_reader_epoch", 0) != my_epoch:
+                return  # superseded by a newer generation (live move)
             try:
                 req = urllib.request.Request(ax.SSE_URL, headers={
                     "Authorization": "Bearer " + self._access_token_for_space(reader_space),
@@ -404,10 +435,34 @@ class AXAdapter(BasePlatformAdapter):
                 for raw in r:
                     if not self._running:
                         break
+                    # Live-move teardown: an old reader generation must stop
+                    # dispatching the moment a newer generation exists. Checked
+                    # before any branch so a stale reader never re-handles an
+                    # event or wakes the agent in the old space.
+                    if getattr(self, "_reader_epoch", 0) != my_epoch:
+                        return
                     line = raw.decode("utf-8", "replace").rstrip("\n")
                     if line.startswith("event:"):
                         event = line[6:].strip()
                     elif line.startswith("data:"):
+                        # Control branch FIRST: the backend emits
+                        # agent_placement_changed on the agent's OLD (still
+                        # subscribed) space stream when its placement moves. We
+                        # handle it before the mention gate so it bypasses
+                        # _event_space_matches (the broker injects the OLD space
+                        # as space_id, which would otherwise be rejected),
+                        # mentions_me, the own-post guard, and dedup — all of
+                        # which are mention-only semantics.
+                        if event == "agent_placement_changed":
+                            try:
+                                d = json.loads(line[5:].strip())
+                            except Exception:
+                                continue
+                            self._handle_placement_changed(d)
+                            # This reader belongs to a now-stale space set; the
+                            # handler bumps the epoch and respawns. Exit here so
+                            # we do not keep reading the old stream.
+                            return
                         if event != "mention":
                             continue
                         try:
@@ -507,6 +562,101 @@ class AXAdapter(BasePlatformAdapter):
             d.get("id"), event_space, sorted(expected),
         )
         return False
+
+    def _handle_placement_changed(self, d: dict) -> None:
+        """React to the backend ``agent_placement_changed`` SSE control event.
+
+        Contract (DB-authoritative): this event is ONLY a wake/re-resolve
+        trigger. We do NOT trust ``new_space_id`` from the payload (a stale or
+        forged old-space stream could carry a wrong value); we always re-read the
+        committed placement via ``_derive_agent_space_id`` (GET
+        /api/v1/agents/me). The payload is used only to (a) ignore events naming
+        a different agent that shares the old-space stream, and (b) log staleness.
+
+        Loop-safety: every subscribed reader receives the broadcast (plus an
+        optional dual-publish to old+new spaces), so the SAME agent can see this
+        event 2..N times. A single-flight lock + flag ensure exactly one reader
+        performs the teardown/respawn; the rest no-op. A derive-and-compare
+        short-circuit absorbs duplicates/no-op moves (target == current).
+        """
+        # Wrong-agent guard: an old-space stream carries many agents' events.
+        # React ONLY to our own agent_id (the inverse of the mention echo-guard).
+        evt_agent = d.get("agent_id")
+        if evt_agent and self.agent_id and str(evt_agent) != str(self.agent_id):
+            return
+
+        with self._resub_lock:
+            if self._resubscribing:
+                return  # another reader is already handling this move
+            self._resubscribing = True
+        try:
+            # Re-resolve DB-authoritative placement. Never trust payload values.
+            try:
+                new_space = self._derive_agent_space_id()
+            except Exception as e:
+                # Hard failure resolving placement: do NOT tear down the live
+                # subscription (that would make the agent deaf everywhere).
+                logger.warning(
+                    "aX: placement re-resolve failed (%r); keeping current subscription", e)
+                return
+
+            if not new_space:
+                # Suspended/detached/unauthorized after move -> empty derive.
+                # Keep existing readers rather than blanking the subscription.
+                logger.warning(
+                    "aX: placement event for @%s but derive returned no space; "
+                    "keeping current subscription (ts=%s)", self.handle, d.get("ts"))
+                return
+
+            # No-op short-circuit (idempotent against duplicate/repeated events
+            # and moves whose target equals the current space): compare BOTH the
+            # home space AND the full recomputed subscription set.
+            recomputed = set(self._compute_subscribed_for(new_space))
+            if (str(new_space) == str(self.space_id)
+                    and recomputed == set(self._subscribed_spaces)):
+                logger.info(
+                    "aX: placement event for @%s is a no-op (space unchanged: %s)",
+                    self.handle, new_space)
+                return
+
+            logger.info(
+                "aX: placement change for @%s: %s -> %s (ts=%s); re-subscribing",
+                self.handle, self.space_id, new_space, d.get("ts"))
+
+            # Bump epoch: old readers self-terminate on their next SSE line.
+            self._reader_epoch += 1
+
+            # Re-resolve home + apply (updates self.space_id, home_space,
+            # HomeChannel in config.platforms['ax'], ax.SPACE_ID).
+            self._apply_space_id(new_space)
+
+            # Set the subscription set BEFORE spawning so _event_space_matches
+            # admits the new space immediately.
+            subscribed = self._discover_subscribed_spaces()
+            self._subscribed_spaces = set(subscribed)
+
+            # Invalidate stale per-space tokens (drops the 600s cached old-space
+            # token) so the moved agent does not consume/send on the old space.
+            with self._space_token_lock:
+                self._space_token.clear()
+
+            # Spawn the new generation (captures the bumped epoch).
+            self._spawn_readers(subscribed)
+        finally:
+            self._resubscribing = False
+
+    def _compute_subscribed_for(self, home_space: str) -> List[str]:
+        """Recompute the subscription set as if ``home_space`` were current.
+
+        Mirrors _discover_subscribed_spaces but parameterized on the candidate
+        home space so the no-op short-circuit can compare without mutating state.
+        """
+        home = str(home_space or "")
+        spaces = [home] if home else []
+        for sid in (getattr(self, "_authorized_space_ids", None) or []):
+            if sid:
+                spaces.append(str(sid))
+        return self._ordered_unique(spaces)
 
     def _mark_no_reply(self, d: dict) -> None:
         """Publish a visible no-reply status on the triggering message.
