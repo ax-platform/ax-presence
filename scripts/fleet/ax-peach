@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run aX MCP calls AS @peach via mcporter, self-refreshing peach's token.
+# (The Hermes gateway used to refresh /home/ax-agents/.ax/peach-listener.json;
+#  now this wrapper owns refresh so peach identity survives without the gateway.)
+# Usage:  ax-peach <tool> [key=value ...]      e.g.  ax-peach whoami
+#         ax-peach messages action=check limit=10
+set -euo pipefail
+TOKFILE=/home/ax-agents/.ax/peach-listener.json
+CFG=/home/ax-agents/.mcporter/mcporter.json
+SERVER=ax-paxai-peach
+TOKEN_ENDPOINT=https://paxai.app/oauth/token
+
+# Refresh the token in-place if it expires within 120s (rotates refresh_token).
+python3 - "$TOKFILE" "$TOKEN_ENDPOINT" <<'PY'
+import json,sys,time,urllib.request,urllib.parse
+tokfile,endpoint=sys.argv[1],sys.argv[2]
+d=json.load(open(tokfile))
+if d.get("expires_at",0) - time.time() > 120:
+    sys.exit(0)
+body=urllib.parse.urlencode({
+    "grant_type":"refresh_token",
+    "refresh_token":d["refresh_token"],
+    "client_id":d["client_id"],
+}).encode()
+req=urllib.request.Request(endpoint,data=body,
+    headers={"Content-Type":"application/x-www-form-urlencoded"})
+with urllib.request.urlopen(req,timeout=20) as r:
+    new=json.load(r)
+d["access_token"]=new["access_token"]
+if new.get("refresh_token"): d["refresh_token"]=new["refresh_token"]
+d["expires_in"]=new.get("expires_in",900)
+d["expires_at"]=int(time.time())+int(new.get("expires_in",900))
+json.dump(d,open(tokfile,"w"),indent=2)
+sys.stderr.write("[ax-peach] refreshed peach token\n")
+PY
+
+TOKEN=$(python3 -c "import json;print(json.load(open('$TOKFILE'))['access_token'])")
+python3 - "$CFG" "$SERVER" "$TOKEN" <<'PY'
+import json,sys
+cfg,server,tok=sys.argv[1],sys.argv[2],sys.argv[3]
+d=json.load(open(cfg))
+d["mcpServers"][server].setdefault("headers",{})["Authorization"]="Bearer "+tok
+json.dump(d,open(cfg,"w"),indent=2)
+PY
+
+tool="${1:?usage: ax-peach <tool> [key=value ...]}"; shift || true
+exec mcporter call "$SERVER.$tool" "$@"
