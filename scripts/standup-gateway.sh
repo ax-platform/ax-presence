@@ -9,15 +9,18 @@
 # no multi-consumer token race. Proven on daimon, zephyr, atlas.
 #
 # Usage:
-#   scripts/standup-gateway.sh <handle> [space_id]
+#   scripts/standup-gateway.sh <handle> [bootstrap_space_id]
 #     handle    agent handle (e.g. canary)                 (required)
-#     space_id  aX space                                   (default: $AX_SPACE_ID)
+#     bootstrap_space_id  only needed for first device-code token mint
+#                         (running gateways derive current space from aX DB)
 #
 # Env knobs:
 #   AGENTS_ROOT      where agent homes live   (default: /home/ax-agents/agents)
 #   HOME_DIR         override the agent home  (default: $AGENTS_ROOT/<handle>)
 #   REUSE_AUTH_FROM  an authed HERMES_HOME whose auth.json (codex login) to copy
 #                    (default: /home/ax-agents/daimon — the shared-Codex-login pattern)
+#   HERMES_MODEL     model written to config.yaml (default: gpt-5.5)
+#   HERMES_PROVIDER  provider written to config.yaml (default: openai-codex)
 #   AX_AGENT_ID      pin the agent UUID in the run script (recommended; avoids the
 #                    auto-resolve/token-refresh race). If unset, the adapter resolves
 #                    it from the token and the script prints a reminder to pin it.
@@ -36,21 +39,22 @@
 #     and MIGRATES an agent off the old echo path (deprecates run-<handle>.sh).
 set -euo pipefail
 
-HANDLE="${1:?usage: standup-gateway.sh <handle> [space_id]}"
-SPACE_ID="${2:-${AX_SPACE_ID:-}}"
+HANDLE="${1:?usage: standup-gateway.sh <handle> [bootstrap_space_id]}"
+BOOTSTRAP_SPACE_ID="${2:-${AX_SPACE_ID:-}}"
 AGENTS_ROOT="${AGENTS_ROOT:-/home/ax-agents/agents}"
 HOME_DIR="${HOME_DIR:-$AGENTS_ROOT/$HANDLE}"
 REUSE_AUTH_FROM="${REUSE_AUTH_FROM:-/home/ax-agents/daimon}"
+HERMES_MODEL="${HERMES_MODEL:-gpt-5.5}"
+HERMES_PROVIDER="${HERMES_PROVIDER:-openai-codex}"
 AX_PRESENCE_DIR="${AX_PRESENCE_DIR:-/home/ax-agents/ax-presence}"
 SPONSOR="${AX_SPONSOR:-@madtank}"
 TOKEN_FILE="$HOME/.ax/$HANDLE-listener.json"
 export PATH="$HOME/.local/bin:$PATH"
 
-[ -n "$SPACE_ID" ] || { echo "standup: set space_id (arg 2) or AX_SPACE_ID" >&2; exit 1; }
 command -v hermes  >/dev/null || { echo "standup: hermes not installed" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "standup: python3 not found" >&2; exit 1; }
 
-echo "standup: @$HANDLE  home=$HOME_DIR  space=$SPACE_ID  token=$TOKEN_FILE"
+echo "standup: @$HANDLE  home=$HOME_DIR  bootstrap_space=${BOOTSTRAP_SPACE_ID:-<token-derived>}  model=$HERMES_PROVIDER/$HERMES_MODEL  token=$TOKEN_FILE"
 mkdir -p "$HOME_DIR" "$HOME/.ax"
 
 # ── 1. brain backend (Plane 2): per-HERMES_HOME auth.json (shared codex login) ──
@@ -65,10 +69,10 @@ if [ ! -f "$HOME_DIR/auth.json" ]; then
 fi
 
 # ── 2. config.yaml: MINIMAL zephyr pattern (no mcp OAuth block) ────────────────
-cat > "$HOME_DIR/config.yaml" <<'YAML'
+cat > "$HOME_DIR/config.yaml" <<YAML
 model:
-  default: gpt-5.5
-  provider: openai-codex          # rides the shared Codex login (no API key)
+  default: $HERMES_MODEL
+  provider: $HERMES_PROVIDER
 
 plugins:
   enabled:
@@ -103,9 +107,10 @@ HERMES_HOME="$HOME_DIR" hermes -c -z "Reply with exactly one word: ready" 2>&1 |
 
 # ── 6. aX identity (Plane 1): mint the device-code token if missing ────────────
 if [ ! -f "$TOKEN_FILE" ]; then
+  [ -n "$BOOTSTRAP_SPACE_ID" ] || { echo "standup: first token mint needs bootstrap_space_id (arg 2) or AX_SPACE_ID; later gateway runs derive space from aX DB" >&2; exit 1; }
   echo "standup: no aX token yet — minting via device-code (approve the URL below)."
   echo "  (echo_agent mints the token, then we stop it and run the gateway.)"
-  ( cd "$HOME_DIR" && AX_AGENT_HANDLE="$HANDLE" AX_SPACE_ID="$SPACE_ID" \
+  ( cd "$HOME_DIR" && AX_AGENT_HANDLE="$HANDLE" AX_SPACE_ID="$BOOTSTRAP_SPACE_ID" \
       AX_TOKEN_FILE="$TOKEN_FILE" PYTHONUNBUFFERED=1 \
       python3 "$AX_PRESENCE_DIR/examples/echo-agent/echo_agent.py" ) &
   MINT_PID=$!
@@ -132,10 +137,8 @@ RUN="$HOME_DIR/run-$HANDLE-gateway.sh"
   else
     echo "# export AX_AGENT_ID=<uuid>   # TODO pin after first connect (avoids resolve race)"
   fi
-  echo "export AX_SPACE_ID=$SPACE_ID"
   echo "export AX_TOKEN_FILE=\"$TOKEN_FILE\""
   echo "export AX_PRESENCE_DIR=$AX_PRESENCE_DIR"
-  echo 'export AX_HOME_SPACE="$AX_SPACE_ID"'
   echo "export AX_SPONSOR=$SPONSOR"
   echo 'export AX_ALLOW_ALL_USERS=true'
   echo 'export PYTHONUNBUFFERED=1'

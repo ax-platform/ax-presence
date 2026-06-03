@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# agent-move-and-verify.sh — restart an aX/Hermes gateway listener into a destination
-# space and verify that presence alone is not treated as ready.
+# agent-move-and-verify.sh — restart an aX/Hermes gateway listener after the
+# backend agent record has been moved to a destination space, then verify that
+# presence alone is not treated as ready.
 #
 # Usage:
 #   scripts/agent-move-and-verify.sh <handle> <destination-space-id> [--post-smoke]
@@ -12,6 +13,8 @@
 #      launched through scripts/standup-gateway.sh.
 #
 # Proof boundary:
+#   - This script does not change agent placement. aX DB is the source of truth;
+#     update/move the backend agent row first, then restart/verify here.
 #   - This script verifies restart + fresh destination-space SSE/presence.
 #   - If --post-smoke is supplied, it posts a synthetic mention from SMOKE_TOKEN_FILE
 #     and polls for a target-agent reply. For final human-facing "ready", prefer a
@@ -58,30 +61,69 @@ command -v python3 >/dev/null || { echo "move: python3 not found" >&2; exit 127;
 
 log() { printf 'move: %s\n' "$*"; }
 
+stop_profile_gateway_lock_holder() {
+  # `hermes gateway stop` can refuse when invoked from a gateway-backed profile
+  # because it thinks the caller is "inside" a gateway process. For move proof we
+  # still need to clear only the target profile's stale lock holder. Parse the
+  # target profile status and kill only a cmdline that is exactly this handle's
+  # Hermes gateway.
+  local status_out pid cmd
+  HERMES_HOME="$PROFILE_BASE" hermes -p "$HANDLE" gateway stop >/dev/null 2>&1 || true
+  status_out="$(HERMES_HOME="$PROFILE_BASE" hermes -p "$HANDLE" gateway status 2>/dev/null || true)"
+  pid="$(python3 -c 'import re,sys; m=re.search(r"PID:\s*(\d+)", sys.stdin.read()); print(m.group(1) if m else "")' <<<"$status_out")"
+  [ -n "$pid" ] || return 0
+  [ -r "/proc/$pid/cmdline" ] || return 0
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+  case "$cmd" in
+    *"hermes -p $HANDLE gateway run"*|*"hermes"*" -p $HANDLE gateway run"*)
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        [ -e "/proc/$pid" ] || break
+        sleep 1
+      done
+      if [ -e "/proc/$pid" ]; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      log "stopped stale @$HANDLE gateway pid $pid"
+      ;;
+    *)
+      log "refusing to stop unexpected @$HANDLE pid $pid cmd=$cmd"
+      ;;
+  esac
+}
+
 patch_profile_run_script() {
   [ -f "$PROFILE_RUN" ] || return 1
-  python3 - "$PROFILE_RUN" "$DEST_SPACE" <<'PY'
+  python3 - "$PROFILE_RUN" <<'PY'
 from pathlib import Path
 import re, sys
 path = Path(sys.argv[1])
-dest = sys.argv[2]
 text = path.read_text()
-text2 = re.sub(r'^export AX_SPACE_ID=.*$', f'export AX_SPACE_ID={dest}', text, flags=re.M)
-if 'export AX_HOME_SPACE="$AX_SPACE_ID"' not in text2:
-    text2 = text2.replace(f'export AX_SPACE_ID={dest}\n', f'export AX_SPACE_ID={dest}\nexport AX_HOME_SPACE="$AX_SPACE_ID"\n')
+text2 = re.sub(r'^export AX_SPACE_ID=.*\n?', '', text, flags=re.M)
+text2 = re.sub(r'^export AX_HOME_SPACE=.*\n?', '', text2, flags=re.M)
 if text2 != text:
     path.write_text(text2)
 PY
-  log "profile run script points @$HANDLE at $DEST_SPACE ($PROFILE_RUN)"
+  log "profile run script leaves @$HANDLE space/home to aX DB ($PROFILE_RUN)"
 }
 
 restart_profile_gateway() {
   patch_profile_run_script || return 1
   CURRENT_LOG="$PROFILE_LOG"
   tmux kill-session -t "$TMUX_SESSION" 2>/dev/null && log "stopped tmux $TMUX_SESSION" || true
+  # Some wrappers are launched via `sg docker -c ...`; killing the tmux session
+  # alone can leave the profile gateway orphaned and still holding Hermes' lock.
+  # Stop only this profile before relaunching so the move smoke exercises the
+  # fresh destination-space listener rather than an older orphan.
+  stop_profile_gateway_lock_holder
   sleep 2
-  tmux new -d -s "$TMUX_SESSION" "bash $PROFILE_RUN > $PROFILE_LOG 2>&1"
-  log "launched tmux $TMUX_SESSION using $PROFILE_RUN"
+  if getent group docker >/dev/null 2>&1 && ! id -nG | tr ' ' '\n' | grep -qx docker; then
+    tmux new -d -s "$TMUX_SESSION" "sg docker -c 'bash \"$PROFILE_RUN\"' > $PROFILE_LOG 2>&1"
+    log "launched tmux $TMUX_SESSION via sg docker using $PROFILE_RUN"
+  else
+    tmux new -d -s "$TMUX_SESSION" "bash $PROFILE_RUN > $PROFILE_LOG 2>&1"
+    log "launched tmux $TMUX_SESSION using $PROFILE_RUN"
+  fi
 }
 
 restart_standalone_gateway() {
@@ -156,7 +198,26 @@ try:
     token = switch_data.get("new_token") or switch_data.get("access_token") or base_token
 except Exception as exc:
     print(json.dumps({"space_switch_warning": f"{type(exc).__name__}: {exc}"}, sort_keys=True))
+sender_agent_id = None
+try:
+    me_req = urllib.request.Request(
+        f"{base}/api/v1/agents/me",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json", "X-Space-Id": space},
+    )
+    with urllib.request.urlopen(me_req, timeout=15) as r:
+        me_raw = r.read()
+    me_data = json.loads(me_raw.decode() if isinstance(me_raw, bytes) else me_raw) if me_raw else {}
+    me_agent = me_data.get("agent") if isinstance(me_data, dict) else None
+    if isinstance(me_agent, dict):
+        me_data = me_agent
+    sender_agent_id = me_data.get("id") if isinstance(me_data, dict) else None
+except Exception as exc:
+    print(json.dumps({"sender_agent_lookup_warning": f"{type(exc).__name__}: {exc}"}, sort_keys=True))
 headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "application/json", "X-Space-Id": space}
+if sender_agent_id:
+    # Avoid creating synthetic smokes under the human session associated with the
+    # token file; helper-originated posts should carry the sending agent identity.
+    headers["X-Agent-Id"] = str(sender_agent_id)
 content = f"@{handle} move verification smoke: reply with READY and your handle."
 body = json.dumps({"content": content, "space_id": space, "channel": "main", "message_type": "text"}).encode()
 req = urllib.request.Request(f"{base}/api/v1/messages", data=body, method="POST", headers=headers)
@@ -240,19 +301,21 @@ PY
 verify_log_dispatch() {
   local msg_id="$1"
   [ -n "$CURRENT_LOG" ] || return 1
-  python3 - "$CURRENT_LOG" "$msg_id" <<'PY'
+  python3 - "$msg_id" "$CURRENT_LOG" "$PROFILE_BASE/profiles/$HANDLE/logs/gateway.log" "$PROFILE_BASE/profiles/$HANDLE/logs/agent.log" <<'PY'
 from pathlib import Path
 import json, sys, time
-log_path, msg_id = sys.argv[1:]
+msg_id = sys.argv[1]
+log_paths = [p for p in sys.argv[2:] if p]
 for _ in range(45):
-    text = Path(log_path).read_text(errors="replace") if Path(log_path).exists() else ""
-    inbound = "aX inbound dispatch:" in text and f"msg={msg_id}" in text
-    sent = "aX send delivered:" in text and f"parent={msg_id}" in text
-    if inbound:
-        print(json.dumps({"gateway_log": log_path, "inbound_dispatch_for": msg_id, "send_delivery_for_parent": sent}, sort_keys=True))
-        raise SystemExit(0)
+    for log_path in log_paths:
+        text = Path(log_path).read_text(errors="replace") if Path(log_path).exists() else ""
+        inbound = "aX inbound dispatch:" in text and f"msg={msg_id}" in text
+        sent = "aX send delivered:" in text and f"parent={msg_id}" in text
+        if inbound:
+            print(json.dumps({"gateway_log": log_path, "inbound_dispatch_for": msg_id, "send_delivery_for_parent": sent}, sort_keys=True))
+            raise SystemExit(0)
     time.sleep(2)
-print(json.dumps({"gateway_log": log_path, "inbound_dispatch_for": msg_id, "found": False}, sort_keys=True))
+print(json.dumps({"gateway_logs": log_paths, "inbound_dispatch_for": msg_id, "found": False}, sort_keys=True))
 raise SystemExit(30)
 PY
 }
