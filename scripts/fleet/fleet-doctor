@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""fleet-doctor — single pane that DETECTS, DIAGNOSES (why), ALERTS, and BOUNCES.
+
+Pipeline per agent:
+  gather  platform(aX agents API) + local(/proc,ss) + token + recent-log signals
+  probe   active round-trip for ambiguous cases (receipt in log == SSE alive)
+  classify  -> verdict + WHY + remedy
+  act     --bounce restarts DEAF/DOWN agents (dry-run unless --apply)
+          --alert posts the summary to aX as @peach
+
+Verdicts:
+  OK              received inbound recently / probe landed
+  QUIET           alive (probe landed) but no organic traffic lately   (not a fault)
+  DEAF            process up, sse_connected, but probe NOT received     -> bounce
+  DOWN            no gateway process on this box                        -> (start)
+  DISABLED        control.state=disabled (kill-switch, intentional)     -> leave alone
+  NO_HOME         "No home channel" seen in logs (home-space derive failed) -> config
+  TOKEN           token expired & refresh failing                       -> re-auth
+"""
+import json, os, re, subprocess, sys, time
+
+HERE = "/home/ax-agents"
+BOUNCE_LOG = f"{HERE}/peach/logs/fleet-bounces.log"
+DEAF_AFTER_S = 30*60
+APPLY  = "--apply"  in sys.argv      # actually perform bounces
+BOUNCE = "--bounce" in sys.argv      # consider bouncing (dry-run unless --apply)
+PROBE  = "--probe"  in sys.argv or BOUNCE   # confirm deaf via round-trip
+ALERT  = "--alert"  in sys.argv
+
+def sh(cmd, t=40):
+    try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t).stdout
+    except Exception: return ""
+
+def platform_agents():
+    sh(f"{HERE}/peach/bin/ax-peach agents action=list view_scope=all --output json 2>/dev/null > /tmp/fd_agents.json")
+    try: return {a["name"]: a for a in json.load(open("/tmp/fd_agents.json"))["data"]["items"] if a.get("name")}
+    except Exception: return {}
+
+def agent_log(handle, home):
+    # -p <profile> agents log to profiles/<h>/logs even though HERMES_HOME is shared
+    for p in (f"{home}/profiles/{handle}/logs/agent.log", f"{home}/logs/agent.log"):
+        if os.path.exists(p): return p
+    return f"{home}/logs/agent.log"
+
+def local_gateways():
+    res = {}
+    for pid in sh("pgrep -f 'gateway run'").split():
+        try: e = dict(x.split("=",1) for x in open(f"/proc/{pid}/environ").read().split("\0") if "=" in x)
+        except Exception: continue
+        h = e.get("AX_AGENT_HANDLE")
+        if h:
+            ppid = sh(f"ps -o ppid= -p {pid}").strip()
+            home = e.get("HERMES_HOME","")
+            res[h] = {"pid": pid, "ppid": ppid, "home": home, "log": agent_log(h, home)}
+    return res
+
+def last_inbound_age(log):
+    if not log or not os.path.exists(log): return None
+    last = sh(f"grep -hE 'inbound message: platform=ax' {log} {log}.1 2>/dev/null | tail -1")
+    if not last: return None
+    try: return int(time.time() - time.mktime(time.strptime(last[:19], "%Y-%m-%d %H:%M:%S")))
+    except Exception: return None
+
+def saw_no_home(log):
+    return bool(sh(f"grep -hcE 'No home channel' {log} 2>/dev/null | grep -vqx 0 && echo 1"))
+
+def live_home_space(log):
+    """The space the agent's LIVE connection is actually bound to (from its last
+    'connected as @h on home space X' line). Compared against the DB space_id to
+    detect a move whose connection hasn't reset yet."""
+    if not log or not os.path.exists(log):
+        return None
+    line = sh(f"grep -hE 'connected as @.* on home space' {log} 2>/dev/null | tail -1")
+    m = re.search(r"on home space ([0-9a-fA-F-]{8,})", line)
+    return m.group(1) if m else None
+
+def token_state(home, handle):
+    # best-effort: listener token files we know about
+    for f in (f"{HERE}/.ax/{handle}-listener.json", f"{home}/.ax/{handle}-listener.json"):
+        if os.path.exists(f):
+            try:
+                d = json.load(open(f)); return d.get("expires_at",0) - time.time()
+            except Exception: pass
+    return None
+
+def probe(targets, gws):
+    """send a probe to each, return set of handles whose log received it."""
+    nonce = "fd"+str(int(time.time()))[-6:]
+    for h in targets:
+        msg = f'@{h} fleet-doctor probe {nonce} — automated SSE liveness check from @peach.'
+        sh(f'{HERE}/peach/bin/ax-peach messages action=send content={json.dumps(msg)} bypass=true >/dev/null 2>&1')
+    time.sleep(45)
+    alive = set()
+    for h in targets:
+        log = gws[h]["log"]
+        if sh(f"grep -hF '{nonce}' {log} {log}.1 2>/dev/null | grep -c 'inbound message'").strip() not in ("","0"):
+            alive.add(h)
+    return alive
+
+def bounce(handle, gw):
+    """restart a gateway via its supervisor (kill child; loop relaunches)."""
+    line = f"{time.strftime('%F %T')} bounce {handle} pid={gw['pid']}"
+    if not APPLY:
+        print(f"   DRY-RUN would: kill -TERM {gw['pid']}  (supervisor relaunches)")
+        return
+    r = sh(f"kill -TERM {gw['pid']} 2>&1")
+    os.makedirs(os.path.dirname(BOUNCE_LOG), exist_ok=True)
+    open(BOUNCE_LOG,"a").write(line + (" OK" if not r else f" ERR {r}") + "\n")
+    print(f"   bounced {handle} ({'ok' if not r else r})")
+
+def main():
+    plat = platform_agents()
+    gws  = local_gateways()
+    team = sorted(set(gws) | {n for n,a in plat.items() if a.get("connection_type")=="cli"})
+
+    # pre-classify to decide who to probe (process up + not disabled + locally present)
+    pending = [h for h in team if h in gws and (plat.get(h,{}).get("control") or {}).get("state")!="disabled"]
+    alive = probe(pending, gws) if (PROBE and pending) else None
+
+    rows, problems = [], []
+    for h in team:
+        a = plat.get(h, {}); g = gws.get(h)
+        ctrl = (a.get("control") or {}).get("state")
+        sse  = a.get("sse_connected")
+        db_space   = str(a.get("space_id") or "")
+        live_space = live_home_space(g["log"]) if g else None
+        age  = last_inbound_age(g["log"]) if g else None
+        why = remedy = ""
+        if ctrl == "disabled":
+            v, why = "DISABLED", "kill-switch (intentional)"; remedy="leave (enable to restore)"
+        elif not g:
+            v = "DOWN" if a.get("connection_type")=="cli" else "elsewhere"
+            why = "no gateway process on this box"; remedy="start gateway" if v=="DOWN" else ""
+        elif db_space and live_space and live_space != db_space:
+            v = "MOVED"; why = f"placement changed: DB={db_space[:8]} != live={live_space[:8]} (connection stale on old space)"; remedy="bounce (reconnect to assigned space)"
+        elif g and saw_no_home(g["log"]):
+            v, why = "NO_HOME", "home-space derive failed (no home channel)"; remedy="ensure AX_AGENT_ID+token; re-derive"
+        elif alive is not None and h in pending:
+            if h in alive:
+                v = "OK" if (age is not None and age<=DEAF_AFTER_S) else "QUIET"
+                why = "probe received" + ("" if v=="OK" else "; no organic traffic")
+            else:
+                v, why = "DEAF", "process up + sse_connected but probe NOT received (SSE reader stalled)"; remedy="bounce"
+        else:
+            v = "OK" if (age is not None and age<=DEAF_AFTER_S) else "? (no probe)"
+        tok = token_state(g["home"], h) if g else None
+        if tok is not None and tok < 0 and v not in ("DISABLED",):
+            why += " | token EXPIRED"
+        rows.append((h, v, (g['pid'] if g else '-'), str(sse), str(ctrl), why, remedy))
+        if v in ("DEAF","DOWN","NO_HOME","MOVED"): problems.append((h, v, g))
+
+    print(f"FLEET-DOCTOR — {time.strftime('%F %T')}  (platform:{len(plat)} local:{len(gws)} probed:{len(pending) if alive is not None else 0})\n")
+    print(f"{'HANDLE':10}{'VERDICT':10}{'PID':8}{'SSE':6}{'CTRL':9}WHY")
+    for h,v,pid,sse,ctrl,why,rem in rows:
+        print(f"{h:10}{v:10}{str(pid):8}{sse:6}{ctrl:9}{why}")
+    if problems:
+        print("\nPROBLEMS & REMEDY:")
+        for h,v,g in problems:
+            rem = next(r[6] for r in rows if r[0]==h)
+            print(f"  {h}: {v} -> {rem}")
+            if BOUNCE and v in ("DEAF","MOVED") and g:
+                bounce(h, g)
+    else:
+        print("\nall agents healthy ✓")
+
+    if ALERT and problems:
+        summary = "fleet-doctor alert: " + ", ".join(f"{h}={v}" for h,v,_ in problems)
+        sh(f'{HERE}/peach/bin/ax-peach messages action=send content={json.dumps(summary)} >/dev/null 2>&1')
+        print(f"\nalerted: {summary}")
+
+if __name__ == "__main__":
+    main()

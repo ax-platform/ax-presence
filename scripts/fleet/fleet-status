@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""fleet-status — single-pane health for the whole agent team (not one-by-one).
+
+Combines THREE views, because no single one tells the truth:
+  1. PLATFORM  (aX agents API, one call)  -> who the team is, control/kill-switch,
+                                              sse_connected, routable
+  2. LOCAL     (/proc + ss)               -> is the gateway process actually up,
+                                              how many live :443 sockets
+  3. RECEIPT   (logs/agent.log)           -> when did it LAST actually receive an
+                                              inbound mention  <-- the deaf detector
+
+"Good" = process up + token valid + platform routable + received inbound recently.
+The dangerous state this catches: platform says sse_connected=True and the process
+is up, but no inbound has arrived in a long time -> SSE reader has gone DEAF.
+(Gold-standard confirmation is an active round-trip probe; see --probe, TODO.)
+"""
+import json, os, subprocess, time, glob, sys
+
+DEAF_AFTER_S = 30 * 60          # no inbound in 30m while "connected" => suspect deaf
+HERE = "/home/ax-agents"
+
+def sh(cmd):
+    try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout
+    except Exception: return ""
+
+def platform_agents():
+    # write to a temp file (large response truncates through a pipe at ~64KB)
+    tmp = "/tmp/fleet_agents.json"
+    sh(f"{HERE}/peach/bin/ax-peach agents action=list view_scope=all --output json 2>/dev/null > {tmp}")
+    try: items = json.load(open(tmp))["data"]["items"]
+    except Exception as e:
+        print(f"(platform fetch failed: {e})", file=sys.stderr); return {}
+    # last record wins on duplicate names
+    return {a.get("name"): a for a in items if a.get("name")}
+
+def local_gateways():
+    """handle -> {pid, home, conns} for every running hermes gateway on this box."""
+    res = {}
+    for pid in sh("pgrep -f 'gateway run'").split():
+        try:
+            env = open(f"/proc/{pid}/environ").read().split("\0")
+        except Exception:
+            continue
+        e = dict(x.split("=", 1) for x in env if "=" in x)
+        h = e.get("AX_AGENT_HANDLE")
+        if not h:
+            continue
+        conns = sh(f"ss -tnp 2>/dev/null | grep -c 'pid={pid},'").strip()
+        res[h] = {"pid": pid, "home": e.get("HERMES_HOME", ""), "conns": conns}
+    return res
+
+def last_inbound_age(home):
+    log = os.path.join(home or "", "logs", "agent.log")
+    if not home or not os.path.exists(log):
+        return None
+    # tail-scan for the last inbound line (cheap-ish)
+    last = sh(f"grep -hE 'inbound message: platform=ax' {log} {log}.1 2>/dev/null | tail -1")
+    if not last:
+        return None
+    ts = last[:19]
+    try:
+        t = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+        return int(time.time() - t)
+    except Exception:
+        return None
+
+def fmt_age(s):
+    if s is None: return "never"
+    if s < 90: return f"{s}s"
+    if s < 5400: return f"{s//60}m"
+    return f"{s//3600}h"
+
+def main():
+    plat = platform_agents()
+    loc = local_gateways()
+    # the team = anything cli OR running locally
+    team = sorted(set(loc) | {n for n,a in plat.items() if a.get("connection_type")=="cli"})
+    print(f"FLEET — {time.strftime('%Y-%m-%d %H:%M:%S')}   (platform agents seen: {len(plat)}, local gateways: {len(loc)})\n")
+    print(f"{'HANDLE':11}{'VERDICT':14}{'PID':8}{'CONN':6}{'PLAT_SSE':9}{'CTRL':9}{'LAST_INBOUND':13}")
+    for h in team:
+        a = plat.get(h, {})
+        l = loc.get(h)
+        ctrl = (a.get("control") or {}).get("state", "?")
+        sse = a.get("sse_connected")
+        age = last_inbound_age(l["home"]) if l else None
+        # verdict
+        if ctrl == "disabled":
+            v = "DISABLED"
+        elif not l:
+            v = "elsewhere" if a.get("connection_type")=="cli" else "down(local)"
+        elif age is not None and age > DEAF_AFTER_S and sse:
+            v = "⚠ SUSPECT-DEAF"
+        elif age is not None and age <= DEAF_AFTER_S:
+            v = "✓ OK"
+        else:
+            v = "? unknown"
+        print(f"{h:11}{v:14}{(l['pid'] if l else '-'):8}{(l['conns'] if l else '-'):6}"
+              f"{str(sse):9}{str(ctrl):9}{fmt_age(age):13}")
+    print("\nlegend: ✓OK=received inbound <30m | ⚠SUSPECT-DEAF=up+sse but silent >30m (confirm w/ round-trip) | elsewhere=cli agent not on this box")
+
+if __name__ == "__main__":
+    main()

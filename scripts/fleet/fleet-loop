@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# fleet-loop — the single-pane supervisor as ONE long-running process.
+# (systemd --user is unavailable on this box: no XDG_RUNTIME_DIR / D-Bus / linger.
+#  So instead of N per-agent tmux loops, one loop runs+confirms+detects+heals all.)
+#
+# Each cycle runs fleet-doctor: round-trip probe -> diagnose (why) -> heal.
+# Modes:
+#   fleet-loop                 watch-only: detect + alert, NEVER restarts anything
+#   fleet-loop --heal          also auto-bounce DEAF / start DOWN  (needs perm grant)
+#   INTERVAL=600 fleet-loop    set cycle seconds (default 600 = 10m; probing is chatty)
+set -uo pipefail
+cd /home/ax-agents/peach
+INTERVAL="${INTERVAL:-600}"
+HEAL=""; [ "${1:-}" = "--heal" ] && HEAL="--bounce --apply"
+echo "[fleet-loop] starting; interval=${INTERVAL}s heal=$([ -n "$HEAL" ] && echo on || echo off)"
+while true; do
+  ts=$(date -u +%FT%TZ)
+  # --probe confirms respond via round-trip; --alert posts a summary to aX (as peach)
+  # only when there are problems; $HEAL adds remediation when authorized.
+  out=$(./bin/fleet-doctor --probe --alert $HEAL 2>&1)
+  # surface only the verdict lines + problems to stdout (Monitor-friendly)
+  echo "===== fleet-loop $ts ====="
+  echo "$out" | grep -E "VERDICT|DEAF|DOWN|NO_HOME|TOKEN|DISABLED|PROBLEMS|all agents healthy|bounced|alerted|DRY-RUN"
+  sleep "$INTERVAL"
+done
