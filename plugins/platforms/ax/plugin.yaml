@@ -25,7 +25,7 @@ optional_env:
     prompt: "aX agent id (uuid)"
     password: false
   - name: AX_PRESENCE_DIR
-    description: "Directory containing ax_presence_listener.py (default /home/ax-agents/ax-presence)"
+    description: "Optional directory containing ax_presence_listener.py; inferred from the installed ax-presence checkout when omitted"
     prompt: "ax-presence dir"
     password: false
   - name: AX_SPACE_ID

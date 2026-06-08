@@ -18,7 +18,7 @@ gateway's asyncio loop as MessageEvents, and (c) post replies + typing back.
 
 Env (set per agent by the gateway process; see plugin.yaml):
   AX_AGENT_HANDLE, AX_AGENT_ID, AX_TOKEN_FILE  (required)
-  AX_PRESENCE_DIR   - dir containing ax_presence_listener.py (default below)
+  AX_PRESENCE_DIR   - optional dir containing ax_presence_listener.py
   AX_ALLOW_ALL_USERS / AX_ALLOWED_USERS - gateway authorization
 """
 from __future__ import annotations
@@ -30,13 +30,41 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # --- locate + import the proven aX wire primitives -------------------------------
-_AX_DIR = os.path.expanduser(os.getenv("AX_PRESENCE_DIR", "/home/ax-agents/ax-presence"))
-if _AX_DIR not in sys.path:
+def _find_ax_presence_dir() -> Optional[str]:
+    """Return a portable directory containing ax_presence_listener.py.
+
+    The adapter is developed inside ax-presence at plugins/platforms/ax/adapter.py,
+    but upstream Hermes installs must not depend on a machine-specific
+    development checkout path. Prefer an explicit AX_PRESENCE_DIR, then infer the
+    ax-presence repo root from this file's location for local/dev installs.
+    """
+    candidates = []
+    if os.getenv("AX_PRESENCE_DIR"):
+        candidates.append(Path(os.path.expanduser(os.environ["AX_PRESENCE_DIR"])))
+    here = Path(__file__).resolve()
+    candidates.extend([here.parent, *here.parents])
+
+    for candidate in candidates:
+        if (candidate / "ax_presence_listener.py").is_file():
+            return str(candidate)
+    return None
+
+
+_AX_DIR = _find_ax_presence_dir()
+if _AX_DIR and _AX_DIR not in sys.path:
     sys.path.insert(0, _AX_DIR)
-import ax_presence_listener as ax  # noqa: E402  (path set above)
+try:
+    import ax_presence_listener as ax  # noqa: E402  (path set above)
+except ModuleNotFoundError as exc:  # pragma: no cover - import-time operator hint
+    raise RuntimeError(
+        "aX Hermes adapter requires ax_presence_listener.py. Set AX_PRESENCE_DIR "
+        "to the ax-presence checkout, or install the adapter from the ax-presence "
+        "repo so the listener module is bundled with it."
+    ) from exc
 
 # --- gateway base contract -------------------------------------------------------
 from gateway.platforms.base import (  # noqa: E402
