@@ -135,6 +135,23 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
         self.assertEqual(adapter.home_space, "db-space")
         self.assertEqual(config.home_channel.chat_id, "db-space")
 
+    def test_runtime_space_ignores_env_and_config_until_db_derive(self):
+        config = types.SimpleNamespace(
+            extra={"space_id": "configured-space"},
+            home_channel=None,
+        )
+        with mock.patch.dict(os.environ, {"AX_SPACE_ID": "env-space"}):
+            adapter = self.module.AXAdapter(config)
+
+        self.assertEqual(adapter.space_id, "")
+        adapter._apply_space_id("db-space")
+        self.assertEqual(adapter.space_id, "db-space")
+
+    def test_plugin_manifest_does_not_request_runtime_space_env(self):
+        manifest = (Path(__file__).resolve().parents[1] / "plugins" / "platforms" / "ax" / "plugin.yaml").read_text()
+
+        self.assertNotIn("AX_SPACE_ID", manifest)
+
     def test_register_does_not_advertise_ax_home_space_env_fallback(self):
         class Ctx:
             def register_platform(self, **kwargs):

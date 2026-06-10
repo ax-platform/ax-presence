@@ -88,7 +88,10 @@ class AXAdapter(BasePlatformAdapter):
 
         self.handle = os.getenv("AX_AGENT_HANDLE") or extra.get("handle", "")
         self.agent_id = os.getenv("AX_AGENT_ID") or extra.get("agent_id", "")
-        self.space_id = os.getenv("AX_SPACE_ID") or extra.get("space_id", "")
+        # Runtime placement is DB-derived only.  AX_SPACE_ID / config.extra.space_id
+        # are bootstrap-era inputs and must not seed the live adapter because stale
+        # monitor/run-script env can otherwise override the backend agent record.
+        self.space_id = ""
         self.token_file = os.path.expanduser(
             os.getenv("AX_TOKEN_FILE") or extra.get("token_file", "")
         )
