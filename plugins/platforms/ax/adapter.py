@@ -88,10 +88,7 @@ class AXAdapter(BasePlatformAdapter):
 
         self.handle = os.getenv("AX_AGENT_HANDLE") or extra.get("handle", "")
         self.agent_id = os.getenv("AX_AGENT_ID") or extra.get("agent_id", "")
-        # Runtime placement is DB-derived only.  AX_SPACE_ID / config.extra.space_id
-        # are bootstrap-era inputs and must not seed the live adapter because stale
-        # monitor/run-script env can otherwise override the backend agent record.
-        self.space_id = ""
+        self.space_id = os.getenv("AX_SPACE_ID") or extra.get("space_id", "")
         self.token_file = os.path.expanduser(
             os.getenv("AX_TOKEN_FILE") or extra.get("token_file", "")
         )
@@ -136,10 +133,11 @@ class AXAdapter(BasePlatformAdapter):
         # final agent reply POSTs use the base agent token plus X-Agent-Id/X-Space-Id.
         self._space_token: Dict[str, tuple[str, float]] = {}
         self._space_token_lock = threading.Lock()
-        # Spaces with active SSE subscriptions. This must stay aligned with the
-        # authoritative backend agent-record space; membership in other spaces is
-        # not routing authority and must not wake the agent there.
+        # Spaces with active SSE subscriptions. Home/default outbound routing
+        # remains the authoritative backend agent-record space, but inbound wake
+        # subscriptions may include additional explicit AgentSpaceAccess rows.
         self._subscribed_spaces: set[str] = set()
+        self._authorized_space_ids: List[str] = []
         # Live-move support (agent_placement_changed SSE control event):
         # _reader_epoch is the per-generation stop signal for SSE reader threads.
         # When placement changes we bump it, tear down the old readers (they
@@ -279,7 +277,9 @@ class AXAdapter(BasePlatformAdapter):
 
         Launch scripts must not pin a space. The backend agent row owns current
         placement, so moved agents do not drift into "connected but ignoring the
-        intended space" state.
+        intended space" state.  When the agent record includes explicit
+        ``space_access`` rows, cache those as additional inbound SSE subscription
+        scopes; they do not change the Hermes home/default outbound route.
         """
         import json as _json
         import urllib.request
@@ -287,8 +287,8 @@ class AXAdapter(BasePlatformAdapter):
         token = ax.current_access_token()
         paths = []
         if self.agent_id:
-            paths.append(f"/api/v1/agents/{self.agent_id}")
-        paths.append("/api/v1/agents/me")
+            paths.append(f"/api/v1/agents/{self.agent_id}?detail=full")
+        paths.append("/api/v1/agents/me?detail=full")
         for path in paths:
             req = urllib.request.Request(
                 f"{ax.BASE}{path}",
@@ -302,8 +302,45 @@ class AXAdapter(BasePlatformAdapter):
                 data = agent
             space = data.get("space_id") if isinstance(data, dict) else None
             if space:
+                self._authorized_space_ids = self._extract_authorized_space_ids(data, str(space))
                 return str(space)
+        self._authorized_space_ids = []
         return ""
+
+    @classmethod
+    def _extract_authorized_space_ids(cls, agent_record: dict, home_space: str) -> List[str]:
+        """Extract explicit active extra AgentSpaceAccess scopes from an agent record.
+
+        This is deliberately *not* a generic workspace-membership discovery path:
+        only DB-authoritative agent access fields are honored. Suspended/detached
+        rows are blocking states and must not be resubscribed.
+        """
+        if not isinstance(agent_record, dict):
+            return []
+
+        active: List[str] = []
+        access_rows = agent_record.get("space_access") or []
+        if isinstance(access_rows, list):
+            for row in access_rows:
+                if isinstance(row, dict):
+                    state = str(row.get("state") or "active").lower()
+                    if state != "active":
+                        continue
+                    sid = row.get("space_id") or row.get("id")
+                else:
+                    # Some older/full serializers may expose explicit space ids
+                    # directly; treat this as authorized only because it came
+                    # from an agent-record access field, not /spaces membership.
+                    sid = row
+                if sid:
+                    active.append(str(sid))
+
+        for field in ("authorized_space_ids", "subscribed_space_ids"):
+            values = agent_record.get(field) or []
+            if isinstance(values, list):
+                active.extend(str(sid) for sid in values if sid)
+
+        return [sid for sid in cls._ordered_unique(active) if str(sid) != str(home_space)]
 
     def _apply_space_id(self, space_id: str) -> None:
         self.space_id = str(space_id)

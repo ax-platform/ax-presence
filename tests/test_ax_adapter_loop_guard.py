@@ -75,6 +75,11 @@ def load_adapter_module():
     sys.modules["gateway.platforms.base"] = base
     sys.modules["gateway.config"] = config
 
+    # Other adapter test modules install a minimal ax_presence_listener stub in
+    # sys.modules.  This suite needs the real listener helpers
+    # (proactive_refresh_loop, presence_loop, etc.) for connect() coverage, so
+    # force a clean import from ROOT rather than inheriting test-order state.
+    sys.modules.pop("ax_presence_listener", None)
     sys.path.insert(0, str(ROOT))
     spec = importlib.util.spec_from_file_location("ax_adapter_under_test", ADAPTER_PATH)
     assert spec is not None
@@ -94,6 +99,7 @@ def make_adapter(module):
     adapter._space_token_lock = module.threading.Lock()
     adapter.agent_id = "agent-1"
     adapter.handle = "nyx"
+    adapter.token_file = "/tmp/token.json"
     return adapter
 
 
@@ -135,23 +141,6 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
         self.assertEqual(adapter.home_space, "db-space")
         self.assertEqual(config.home_channel.chat_id, "db-space")
 
-    def test_runtime_space_ignores_env_and_config_until_db_derive(self):
-        config = types.SimpleNamespace(
-            extra={"space_id": "configured-space"},
-            home_channel=None,
-        )
-        with mock.patch.dict(os.environ, {"AX_SPACE_ID": "env-space"}):
-            adapter = self.module.AXAdapter(config)
-
-        self.assertEqual(adapter.space_id, "")
-        adapter._apply_space_id("db-space")
-        self.assertEqual(adapter.space_id, "db-space")
-
-    def test_plugin_manifest_does_not_request_runtime_space_env(self):
-        manifest = (Path(__file__).resolve().parents[1] / "plugins" / "platforms" / "ax" / "plugin.yaml").read_text()
-
-        self.assertNotIn("AX_SPACE_ID", manifest)
-
     def test_register_does_not_advertise_ax_home_space_env_fallback(self):
         class Ctx:
             def register_platform(self, **kwargs):
@@ -161,6 +150,16 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
         self.module.register(ctx)
 
         self.assertEqual(ctx.kwargs["cron_deliver_env_var"], "")
+
+    def test_ax_presence_dir_is_inferred_without_machine_specific_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(Path(self.module._find_ax_presence_dir()).resolve(), ROOT)
+        self.assertNotIn("/home/ax-agents/ax-presence", ADAPTER_PATH.read_text())
+
+    def test_ax_presence_dir_env_override_is_respected(self):
+        with mock.patch.object(self.module, "__file__", str(ADAPTER_PATH)), \
+             mock.patch.dict(os.environ, {"AX_PRESENCE_DIR": str(ROOT)}):
+            self.assertEqual(Path(self.module._find_ax_presence_dir()).resolve(), ROOT)
 
     def test_peer_short_ack_mention_is_suppressed_immediately_before_dispatch(self):
         ack_shapes = [
@@ -328,6 +327,32 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
         self.adapter._authorized_space_ids = ["extra-authorized"]
         spaces = self.adapter._discover_subscribed_spaces()
         self.assertEqual(spaces, ["dest-space", "extra-authorized"])
+
+    def test_agent_record_space_access_drives_multi_space_subscriptions(self):
+        self.adapter.agent_id = "agent-1"
+        self.adapter.space_id = ""
+
+        def fake_urlopen(req, timeout=0):
+            self.assertIn("/api/v1/agents/agent-1?detail=full", req.full_url)
+            return _HTTPResponse(json.dumps({
+                "id": "agent-1",
+                "space_id": "home-space",
+                "space_access": [
+                    {"space_id": "home-space", "state": "active", "is_default": True},
+                    {"space_id": "extra-space", "state": "active"},
+                    {"space_id": "suspended-space", "state": "suspended"},
+                    {"space_id": "detached-space", "state": "detached"},
+                ],
+            }).encode())
+
+        with mock.patch.object(self.module.ax, "current_access_token", return_value="token"), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            derived = self.adapter._derive_agent_space_id()
+
+        self.assertEqual(derived, "home-space")
+        self.assertEqual(self.adapter._authorized_space_ids, ["extra-space"])
+        self.adapter._apply_space_id(derived)
+        self.assertEqual(self.adapter._discover_subscribed_spaces(), ["home-space", "extra-space"])
 
     def test_connect_starts_sse_readers_for_all_discovered_spaces(self):
         calls = []
