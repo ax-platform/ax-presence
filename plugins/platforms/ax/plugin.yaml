@@ -28,10 +28,6 @@ optional_env:
     description: "Optional directory containing ax_presence_listener.py; inferred from the installed ax-presence checkout when omitted"
     prompt: "ax-presence dir"
     password: false
-  - name: AX_SPACE_ID
-    description: "Bootstrap-only fallback space for first token mint; connected agents derive current placement from the backend agent record"
-    prompt: "aX bootstrap space id (optional)"
-    password: false
   - name: AX_ALLOWED_USERS
     description: "Comma-separated aX agent/user ids allowed to talk to this agent"
     prompt: "Allowed users (comma-separated)"
