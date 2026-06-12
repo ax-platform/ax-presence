@@ -26,7 +26,7 @@ Capabilities (each one cost a real bug or a real UX lesson to learn):
     the sponsor on sustained failure or exit; a heartbeat file lets an external
     watchdog catch silent process death (crash/OOM/SIGKILL).
 """
-import json, os, time, sys, threading, atexit, signal, fcntl
+import json, os, time, sys, threading, atexit, signal, fcntl, socket
 import urllib.request, urllib.parse, urllib.error
 
 # --- Per-agent config (set these, or override via AX_* env vars) -------------
@@ -361,24 +361,38 @@ def keeper(mid, stop):
 # stream() ever saw it, and vice versa).
 _wake_requested = False    # consumed by _presence_beat(): force a token refresh
 _wake_reconnect = False    # consumed by stream(): classify the forced reconnect
-_sse_response = None       # live SSE response, stashed by stream() for the wake close
+_sse_response = None       # live SSE response, stashed by stream()
+_sse_socket = None         # its underlying socket — the wake shutdown target
+
+
+def _sse_socket_of(r):
+    """Underlying socket of a live HTTPResponse: r.fp is the BufferedReader
+    from socket.makefile('rb'); its raw SocketIO holds the socket. Extracted
+    once at connect time so the signal handler does zero discovery work."""
+    try:
+        return r.fp.raw._sock
+    except AttributeError:
+        return None
 
 
 def _handle_wake_signal(signum, frame):
     """SIGUSR1 from the fleet daemon: host woke from suspend. Set one flag per
-    consumer, then close the live SSE response: a flag alone can never break a
-    read blocked on a half-open post-suspend socket (PEP 475 just retries the
-    read after this handler returns), so the close IS the reconnect mechanism.
-    Safe here: the handler runs as ordinary bytecode on the main thread — the
-    same thread that owns the read — and close() is idempotent."""
+    consumer, then shut down the live SSE socket: a flag alone can never break
+    a read blocked on a half-open post-suspend socket (PEP 475 just retries
+    the read after this handler returns), so the shutdown IS the reconnect
+    mechanism. It must be shutdown(), NOT close(): the blocked read holds the
+    BufferedReader lock, and CPython's same-thread reentrancy guard makes a
+    close() from this handler raise RuntimeError — the socket would stay open
+    and the listener wedged. shutdown() takes no io lock; the kernel makes the
+    retried recv return EOF, so the read terminates cleanly."""
     globals()["_wake_requested"] = True
     globals()["_wake_reconnect"] = True
-    r = _sse_response
-    if r is not None:
+    s = _sse_socket
+    if s is not None:
         try:
-            r.close()
-        except Exception:
-            pass
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # already disconnected — the flags still force the reconnect
 
 
 def _consume_wake_request():
@@ -694,10 +708,12 @@ def stream():
         "Accept": "text/event-stream",
     })
     r = urllib.request.urlopen(req, timeout=None)
-    # Stash for the SIGUSR1 wake handler, which closes this to break a read
-    # blocked on a half-open post-suspend socket (the only way out: the read
-    # has no timeout and PEP 475 retries it straight through a mere flag).
+    # Stash for the SIGUSR1 wake handler, which shuts the SOCKET down to break
+    # a read blocked on a half-open post-suspend socket (the only way out: the
+    # read has no timeout, PEP 475 retries it straight through a mere flag,
+    # and close() from the handler trips the BufferedReader reentrancy guard).
     globals()["_sse_response"] = r
+    globals()["_sse_socket"] = _sse_socket_of(r)
     # A wake that fired while we were disconnected is already satisfied by
     # this fresh connection — drop the stale request so a later genuine read
     # error is not misclassified as a wake reconnect.
@@ -758,12 +774,18 @@ def stream():
                         threading.Thread(target=keeper, args=(mid, stop), daemon=True).start()
             elif line == "":
                 event = None
+        # The wake shutdown ends the blocked read with recv()=0 -> the loop
+        # exits as a clean EOF, not an exception, so classify the wake here:
+        # an intentional reconnect, not a server hangup worth alarm.
+        if _consume_wake_reconnect():
+            print("[status] wake signal — SSE socket shut down, reconnecting", flush=True)
     except Exception:
         if _consume_wake_reconnect():
-            # Fleet wake (SIGUSR1) closed the socket out from under the read —
-            # an intentional reconnect, not a failure. Return normally so
-            # main() resets its backoff and the circuit breaker never counts
-            # it. The presence beat re-verifies the token on its own flag.
+            # Fleet wake (SIGUSR1) shut the socket down under the read and it
+            # surfaced as an error instead of EOF (e.g. mid-buffer) — still an
+            # intentional reconnect, not a failure. Return normally so main()
+            # resets its backoff and the circuit breaker never counts it. The
+            # presence beat re-verifies the token on its own flag.
             print("[status] wake signal — forcing SSE reconnect", flush=True)
             return
         raise
