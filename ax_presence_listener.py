@@ -92,7 +92,7 @@ def alert(text):
     to the sponsor (aX message, best-effort). Real degradation/exit only."""
     print(f"ALERT [listener] {text}", flush=True)
     try:
-        at = load_tok().get("access_token")
+        at = current_access_token()
         body = json.dumps({"content": f"{SPONSOR} :warning: [{AGENT_HANDLE} listener] {text}",
                            "space_id": SPACE_ID, "channel": "main", "message_type": "text"}).encode()
         urllib.request.urlopen(urllib.request.Request(MESSAGES_URL, data=body,
@@ -159,7 +159,7 @@ def post_processing_status(mid, status, activity=None, tool_name=None, progress=
     """Publish an agent_processing event so the SENDER's progress bar shows
     receipt/progress (no black hole). Best-effort — never blocks the wake."""
     try:
-        at = load_tok().get("access_token")
+        at = current_access_token()
         body = build_processing_body(mid, status, activity, tool_name, progress, detail)
         urllib.request.urlopen(urllib.request.Request(PROCESSING_URL, data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
@@ -209,7 +209,7 @@ def post_message(content, parent_id=None, space_id=None):
     confirm it actually landed — a 2xx alone has silently lied before. Returns the
     new message id (or None). Drives the --reply / --say one-shots so an agent can
     answer a mention in one line instead of hand-rolling a REST call."""
-    at = load_tok().get("access_token")
+    at = current_access_token()
     target_space = space_id or SPACE_ID
     payload = {"content": content, "space_id": target_space,
                "channel": "main", "message_type": "text"}
@@ -356,20 +356,39 @@ def keeper(mid, stop):
     _pending.pop(mid, None)
 
 
+def _presence_beat():
+    """One platform heartbeat POST. The access token can be long-expired by the
+    time a tick runs (host suspend pauses the refresh timer but not wall-clock
+    expiry), so always fetch via current_access_token(); on a 401 force one
+    refresh and retry once instead of spamming with a dead token."""
+    def _post(at):
+        req = urllib.request.Request(HEARTBEAT_URL, data=b"{}",
+            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
+                     "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID})
+        urllib.request.urlopen(req, timeout=10)
+    try:
+        _post(current_access_token())
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        try:
+            _post(refresh()["access_token"])
+        except Exception:
+            globals()["_currently_401"] = True
+            raise
+    globals()["_currently_401"] = False
+
+
 def presence_loop():
-    derive_space_id_from_agent_record()
     """Publish liveness to the PLATFORM: POST /api/v1/agents/heartbeat every ~20s
     (server TTL ~30s) so this agent shows 'online' + responsive in the agents
     presence/availability views. The endpoints already exist server-side; the
     common gap is that agents simply never call them, so everyone reads 'offline'.
     Calling this is what makes an agent discoverable as alive."""
+    derive_space_id_from_agent_record()
     while True:
         try:
-            at = load_tok().get("access_token")
-            req = urllib.request.Request(HEARTBEAT_URL, data=b"{}",
-                headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
-                         "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID})
-            urllib.request.urlopen(req, timeout=10)
+            _presence_beat()
         except Exception as e:
             print(f"[listener] platform heartbeat failed: {e!r}", file=sys.stderr, flush=True)
         time.sleep(20)
@@ -540,21 +559,32 @@ def current_access_token():
     return t["access_token"]
 
 
+def _proactive_tick(now=None):
+    """One refresh-timer decision; returns seconds to sleep, never more than 60.
+    time.sleep does not advance during host suspend (macOS lid-close), so one
+    long sleep-until-expiry strands the timer while wall-clock expiry passes
+    (the 2026-06-12 401 storm). Short slices re-read the file every tick, so a
+    wake refreshes within one slice."""
+    now = int(time.time()) if now is None else now
+    try:
+        remaining = load_tok().get("expires_at", 0) - now
+    except Exception:
+        return 60
+    if remaining > 60:
+        return min(60, remaining - 60)
+    try:
+        refresh()
+    except Exception as e:
+        print(f"[listener] proactive refresh failed: {e!r}", flush=True)
+        return 30
+    return 15
+
+
 def proactive_refresh_loop():
     """Refresh ~60s before expiry, forever, so the token file stays fresh even
     while the SSE connection is held open past the access-token lifetime."""
     while True:
-        try:
-            t = load_tok()
-            sleep_for = (t.get("expires_at", 0) - int(time.time())) - 60
-        except Exception:
-            sleep_for = 60
-        time.sleep(max(15, sleep_for))
-        try:
-            refresh()
-        except Exception as e:
-            print(f"[listener] proactive refresh failed: {e!r}", flush=True)
-            time.sleep(30)
+        time.sleep(_proactive_tick())
 
 
 def mentions_me(d):
