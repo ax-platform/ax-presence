@@ -51,6 +51,17 @@ class FleetConfigTest(unittest.TestCase):
         self.assertEqual(d["fleet"]["device"], "laptop")
         self.assertEqual(d["agents"]["claude_prime"]["catchup"], "ask")
 
+    def test_unknown_platform_fails_loudly_at_load(self):
+        # Phase 1 is single-platform: a typo'd or future platform key must
+        # fail at config load, not silently spawn an ax listener for it.
+        bad = SAMPLE + ('\n[agents.hermes_bot]\n'
+                        'token_file = "~/.ax/hermes-listener.json"\n'
+                        'platform = "hermes"\n')
+        with self.assertRaises(ValueError) as cm:
+            fd.load_fleet_config(self._write(bad))
+        self.assertIn("hermes", str(cm.exception))
+        self.assertIn("platform", str(cm.exception))
+
     def test_both_parsers_agree_disabled_is_a_real_boolean(self):
         # On Python <3.11 the fallback parser used to return the STRING
         # "false", which is truthy — a 'disabled = false' agent would have

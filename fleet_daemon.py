@@ -84,6 +84,12 @@ def load_fleet_config(path):
     for name, a in agents.items():
         for k, v in AGENT_DEFAULTS.items():
             a.setdefault(k, v)
+        if a["platform"] != "ax":
+            # Phase 1 is single-platform: fail loudly at load rather than
+            # silently spawning the ax listener for some other platform.
+            raise ValueError(
+                f"{path}: [agents.{name}] platform = {a['platform']!r} — "
+                "only \"ax\" is supported in Phase 1")
         a["token_file"] = os.path.expanduser(a["token_file"])
     return {"fleet": data.get("fleet", {}), "agents": agents}
 
