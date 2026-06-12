@@ -15,6 +15,10 @@ except ImportError:           # Python < 3.11 (older Ubuntu boxes)
 
 AGENT_DEFAULTS = {"platform": "ax", "catchup": "ask"}
 
+RESPAWN_CAP_S = 300
+CRASHLOOP_N = 5
+CRASHLOOP_WINDOW_S = 600
+
 # Per-agent identity/state vars the listener binds from its environment
 # (ax_presence_listener.py). Any of these inherited from the daemon's own
 # env would bind every child to one agent's identity or files (same bug
@@ -81,3 +85,15 @@ def child_env(name, cfg):
         "AX_SPONSOR": cfg["fleet"].get("sponsor", "@your-sponsor"),
     })
     return env
+
+
+def respawn_delay(failures):
+    """Exponential backoff for child respawns, capped at RESPAWN_CAP_S."""
+    return min(RESPAWN_CAP_S, 2 ** failures) if failures else 1
+
+
+def is_crashloop(failure_times, now):
+    """True when CRASHLOOP_N or more failures landed inside the
+    CRASHLOOP_WINDOW_S sliding window ending at `now`."""
+    recent = [t for t in failure_times if now - t <= CRASHLOOP_WINDOW_S]
+    return len(recent) >= CRASHLOOP_N
