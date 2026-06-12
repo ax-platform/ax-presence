@@ -1,7 +1,7 @@
 # Fleet Daemon & Single Pane — Design
 
 **Date:** 2026-06-12
-**Status:** Validated with @madtank (brainstorm session); circulating to @daimon (owner) and @peach (reviewer)
+**Status:** Validated with @madtank (brainstorm session); circulating to Daimon for auth/presence/security boundary review and @peach for QA review
 **Drivers:** repeated ungraceful laptop-suspend recoveries (latest: 2026-06-12 401 storm, fixed at listener level in PR #32); agents isolated as hand-managed client processes; no single pane of fleet truth.
 
 ## Decisions (locked with Jacob)
@@ -12,7 +12,7 @@
 | 2 | Single pane | **aX is the true dashboard.** Devices feed telemetry up; the aX frontend renders the fleet. Device-local surfaces are for SSH/offline use. |
 | 3 | Control flow | **Telemetry up now; commands down later.** The schema reserves the command envelope, but MVP builds no command execution. "Consolidate on the device, make it solid, send the signals, expand later." |
 | 4 | Local surface | **CLI + live TUI** (`fleet top`). No local web stack; stdlib-only stays the law. |
-| 5 | Sequencing | **Parallel lanes after daemon core.** Freeze the telemetry schema early; ax-backend (signal store) and ax-frontend (fleet pane) build against the contract while the daemon hardens. |
+| 5 | Sequencing | **Parallel lanes after daemon core.** Freeze the telemetry schema at the Phase 1 exit; ax-backend (signal store) and ax-frontend (fleet pane) build against that stable contract while the daemon hardens. |
 | 6 | Catch-up | **Digest, not replay — triaged intelligently** (see §6). High value: the team must learn what they missed while disconnected, without a noise/cost storm. |
 
 ## 1. Architecture
@@ -64,10 +64,10 @@ catchup = "auto"
 
 | Watchdog | Cadence | Detects | Action |
 |----------|---------|---------|--------|
-| **Suspend** | 15s | monotonic vs wall-clock drift > 30s ⇒ device slept | On wake: check every child's token expiry, signal refresh+reconnect (SIGUSR1), 60s alert grace window, emit ONE `suspend_resumed` event (duration, tokens refreshed) — never a 401 storm. PR #32 is the inner (per-listener) layer; this is the outer. |
+| **Suspend** | 15s | monotonic vs wall-clock drift > 30s ⇒ device slept | On wake: inspect every child's token TTL read-only, then either signal a newly implemented child-owned refresh/reconnect handler or restart the child after its own refresh path runs; 60s alert grace window; emit ONE `suspend_resumed` event (duration, children nudged/restarted) — never a 401 storm. Current `ax_presence_listener.py` has no SIGUSR1 refresh handler, so adding that handler is Phase 1 work if signal-based wake handling is chosen. PR #32 is the inner (per-listener) layer; this is the outer. |
 | **Receipt** | 60s | `sse_connected` but no inbound receipt past threshold ⇒ DEAF | Bounce with backoff; audit-logged. (fleet-doctor's deaf detector, in-process.) |
 | **Process** | event | child exit/crash | Respawn with exponential backoff; flapping ⇒ CRASHLOOP, alert sponsor once, hold. |
-| **Token** | 60s | `expires_at` long past while child alive ⇒ TOKEN wedge (the 2026-06-12 failure) | Read-only detection (children refresh their own tokens); verdict + bounce if wedged. |
+| **Token** | 60s | `expires_at` long past while child alive ⇒ TOKEN wedge (the 2026-06-12 failure) | Read-only detection only: the daemon may inspect TTL and bounce a wedged child, but must never refresh, reuse, or rewrite child token files. The child listener remains the sole refresher for its rotating token. |
 
 Verdict vocabulary (continuously computed, was fleet-doctor's): `OK / QUIET / DEAF / DOWN / TOKEN / CRASHLOOP / MOVED / DISABLED`.
 
@@ -78,9 +78,9 @@ Detection is **TTL-based, never goodbye-based** (a closing lid gives no reliable
 | t | What happens |
 |---|--------------|
 | 0 | Lid closes. Beats stop. |
-| ≤ ~90s | aX marks fleet `unreachable` (3 missed 30s beats). **Precedence rule (server-side):** device unreachable ⇒ its agents render "offline (device asleep/unreachable)", suppressing N individual agent alerts and downstream escalations. |
+| ≤ ~90s | aX marks fleet `unreachable` (3 missed 30s beats). **Precedence rule (server-side):** device unreachable ⇒ its agents render "offline (device asleep/unreachable)", suppressing N individual agent alerts and downstream escalations. This is render/alert suppression only; it must not mutate roster lifecycle state, disable agents, or mark agents as archive candidates. |
 | lid opens | — |
-| ≤ 15s | Suspend watchdog fires wake handling (token check, refresh/reconnect signals, grace window). |
+| ≤ 15s | Suspend watchdog fires wake handling (read-only token TTL check, child-owned signal handler if added or controlled restart, grace window). |
 | ≤ 30s | First device beat with `suspend_resumed` event; aX flips fleet online. |
 | then | Catch-up triage (§6) — missed events counted/classified, digest issued per policy. |
 
@@ -96,7 +96,7 @@ Telemetry carries `device` + `fleet_id` + `daemon_version`, so aX knows exactly 
 
 ## 6. Catch-up: digest, not replay
 
-On post-suspend reconnect the listener **counts and classifies** missed events; dispatches nothing yet.
+On post-suspend reconnect the listener **counts and classifies** missed events; dispatches nothing yet. Digest computation is metadata/readback only and must not dispatch model turns until the agent/operator explicitly chooses `catch up all` or `mentions only`.
 
 - **Few and fresh** (≤3 missed, suspend < ~10 min): process normally — asking would be noisier than doing.
 - **Otherwise — one digest wake:**
@@ -121,7 +121,7 @@ Triage rules (the anti-noise-storm core, validated against the 2026-06-10 remind
 
 Per-agent policy: `catchup = auto | ask | skip` + thresholds in `fleet.toml`.
 
-## 7. Telemetry schema (FROZEN CONTRACT for parallel lanes)
+## 7. Telemetry schema (CONTRACT TO FREEZE AT PHASE 1 EXIT)
 
 `POST /api/v1/fleet/telemetry` — every 30s per device, batched:
 
@@ -151,9 +151,9 @@ Per-agent policy: `catchup = auto | ask | skip` + thresholds in `fleet.toml`.
 }
 ```
 
-Server rules: fleet `unreachable` after 3 missed beats (`seq` gap detection); device-down precedence over per-agent alerts; same-agent-two-fleets ⇒ `CONFLICT`. `commands_ack` + a command-polling endpoint are **reserved in the schema, not built in MVP**.
+Server rules: fleet `unreachable` after 3 missed beats (`seq` gap detection); device-down precedence is render/alert suppression over per-agent alerts, not roster lifecycle mutation; same-agent-two-fleets ⇒ `CONFLICT`. `commands_ack` + a command-polling endpoint are **reserved in the schema, not built in MVP**.
 
-Auth: the daemon gets its own device identity/token — it must NOT reuse any agent's rotating listener token (single-refresher rule). Exact mechanism (device PAT vs. dedicated device-code identity) is stack's call within the contract.
+Auth: the daemon gets its own device identity/token — it must NOT reuse, refresh, or rewrite any agent's rotating listener token (single-refresher rule). Exact mechanism (device PAT vs. dedicated device-code identity) is the backend/platform/API/deploy lane's call (@nyx), with Daimon reviewing auth/presence/security boundaries.
 
 ## 8. Local surfaces
 
@@ -172,7 +172,7 @@ Auth: the daemon gets its own device identity/token — it must NOT reuse any ag
  [b]ounce  [p]ause  [d]octor  [q]uit
 ```
 
-aX fleet pane (ax-frontend lane — claude_prime; sketch, final design with the frontend work):
+aX fleet pane (ax-frontend lane — @canary unless Jacob explicitly reassigns; sketch, final design with the frontend work):
 
 ```
  Fleet ▾                                      madtank's Workspace
@@ -194,9 +194,9 @@ The daemon supervises **platform-plugin listener children**, selected per agent 
 |-------|--------------|-------------|
 | 0 (done) | ax-presence / claude_prime | PR #32 — listener-level suspend/token fix |
 | 1 | ax-presence | `fleet_daemon.py` + suspend/receipt/process/token watchdogs + `fleet.toml` + respawn/backoff. **Soak on laptop.** |
-| 1.5 | ax-presence | `fleet` CLI + `fleet top` TUI; migrate graviton from `fleet-loop` shell to daemon. Schema **frozen** at end of phase 1. |
-| 2 ∥ | ax-backend / @stack | `/api/v1/fleet/telemetry` ingest, fleet state model, TTL/precedence/CONFLICT rules, device auth. |
-| 2 ∥ | ax-frontend / @claude_prime | Fleet pane (read-only) against the contract. |
+| 1.5 | ax-presence | `fleet` CLI + `fleet top` TUI; migrate graviton from `fleet-loop` shell to daemon. Consumes the schema frozen at the Phase 1 exit; does not move the contract-stable point. |
+| 2 ∥ | ax-backend / @nyx, Daimon boundary review | `/api/v1/fleet/telemetry` ingest, fleet state model, TTL/precedence/CONFLICT rules, device auth. |
+| 2 ∥ | ax-frontend / @canary unless Jacob reassigns | Fleet pane (read-only) against the contract. |
 | 3 | ax-presence | Catch-up triage engine (§6) in the listener + daemon coordination. |
 | 4 (future) | all | Commands-down (envelope already reserved), richer aX-side fleet control. |
 
@@ -204,7 +204,7 @@ The daemon supervises **platform-plugin listener children**, selected per agent 
 
 1. **Does the listener already poll missed messages on SSE reconnect?** Unverified — catch-up (§6) may build on existing machinery or need it written. Verify before phase 3 planning.
 2. macOS pre-sleep notification as an opportunistic "draining" beat — nice-to-have, never load-bearing.
-3. Device auth mechanism for the telemetry endpoint (stack's call): device PAT vs dedicated device-code identity.
+3. Device auth mechanism for the telemetry endpoint (@nyx backend/platform/API/deploy call, with Daimon boundary review): device PAT vs dedicated device-code identity.
 4. Receipt thresholds per agent class (chatty vs quiet agents) — start uniform (30 min), tune from soak data.
 5. EC2 checkout currently runs dirty `feat/fleet-space-aware` branch with live gateways pointed at it (@peach) — graviton migration (phase 1.5) must coordinate with peach's in-flight work.
 
