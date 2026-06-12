@@ -110,3 +110,14 @@ def suspend_tick(state, mono_now, wall_now):
     if drift > SUSPEND_DRIFT_S:
         return {"kind": "suspend_detected", "for_s": round(drift)}
     return None
+
+
+def token_ttl(token_file, now):
+    """READ-ONLY token inspection. The daemon must never refresh, reuse,
+    or rewrite a child's rotating token file (review-locked invariant);
+    the child listener is the sole refresher."""
+    try:
+        with open(token_file) as f:
+            return int(json.load(f).get("expires_at", 0) - now)
+    except Exception:
+        return None
