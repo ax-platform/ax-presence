@@ -36,12 +36,20 @@ class RuntimeShapeTest(unittest.TestCase):
         tok = os.path.join(d, "tok.json")
         with open(tok, "w") as f:
             json.dump({"expires_at": 5630}, f)
-        hb = os.path.join(d, "hb.json")
+        # REAL listener formats (ax_presence_listener.py heartbeat_loop):
+        # heartbeat file = bare int epoch, rich dict = <handle>-signal.json.
+        hb = os.path.join(d, "a-listener-heartbeat")
         with open(hb, "w") as f:
-            json.dump({"connected": True, "currently_401": False,
-                       "mentions_seen": 142, "replies_sent": 131}, f)
+            f.write(str(5000))
+        sig = os.path.join(d, "a-signal.json")
+        with open(sig, "w") as f:
+            json.dump({"handle": "a", "ts": 5000, "connected": True,
+                       "currently_401": False, "mentions_seen": 142,
+                       "replies_sent": 131, "last_reply_at": 4990,
+                       "responsiveness_ratio": 0.923}, f)
         cfg = {"fleet": {"device": "laptop"},
-               "agents": {"a": {"token_file": tok, "heartbeat_file": hb}}}
+               "agents": {"a": {"token_file": tok, "heartbeat_file": hb,
+                                "signal_file": sig}}}
         agents = {"a": _StubProc("a", log)}
         ctx = fd.new_ctx(cfg, agents, token=None,
                          state_file=os.path.join(d, "state.json"),
@@ -55,7 +63,7 @@ class RuntimeShapeTest(unittest.TestCase):
                          set(golden["device_state"]["host"]))
         self.assertEqual(set(body["agents"]["a"]),
                          set(golden["agents"]["claude_prime"]))
-        # And the listener-owned fields really come from the heartbeat file.
+        # And the listener-owned fields really come from the signal file.
         snap = body["agents"]["a"]
         self.assertEqual(snap["verdict"], "OK")
         self.assertIs(snap["sse_connected"], True)
