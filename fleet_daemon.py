@@ -19,6 +19,8 @@ RESPAWN_CAP_S = 300
 CRASHLOOP_N = 5
 CRASHLOOP_WINDOW_S = 600
 
+SUSPEND_DRIFT_S = 30
+
 # Per-agent identity/state vars the listener binds from its environment
 # (ax_presence_listener.py). Any of these inherited from the daemon's own
 # env would bind every child to one agent's identity or files (same bug
@@ -97,3 +99,14 @@ def is_crashloop(failure_times, now):
     CRASHLOOP_WINDOW_S sliding window ending at `now`."""
     recent = [t for t in failure_times if now - t <= CRASHLOOP_WINDOW_S]
     return len(recent) >= CRASHLOOP_N
+
+
+def suspend_tick(state, mono_now, wall_now):
+    """Detect host suspend: wall-clock advanced while the monotonic clock
+    (which pauses during macOS suspend) did not. Mutates state for the
+    next tick; returns a suspend event dict or None."""
+    drift = (wall_now - state["wall"]) - (mono_now - state["mono"])
+    state["mono"], state["wall"] = mono_now, wall_now
+    if drift > SUSPEND_DRIFT_S:
+        return {"kind": "suspend_detected", "for_s": round(drift)}
+    return None
