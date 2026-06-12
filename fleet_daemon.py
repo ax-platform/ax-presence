@@ -212,6 +212,29 @@ def wake_fanout(agents):
     return nudged
 
 
+def post_telemetry(body, base, token):
+    """Best-effort: the endpoint ships later (nyx's lane); 404s and network
+    errors are harmless no-ops, same pattern as the listener's SIGNAL_URL."""
+    if not token:
+        return
+    try:
+        urllib.request.urlopen(urllib.request.Request(
+            base + "/api/v1/fleet/telemetry", data=json.dumps(body).encode(),
+            headers={"Authorization": "Bearer " + token,
+                     "Content-Type": "application/json"}), timeout=10)
+    except Exception:
+        pass
+
+
+def write_state_file(path, state):
+    """Local mirror of the latest telemetry body — what `fleet status` /
+    `fleet top` (phase 1.5) will read."""
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    fd_ = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd_, "w") as f:
+        json.dump(state, f, indent=2)
+
+
 def listener_argv():
     return [sys.executable, "-u",
             os.path.join(os.path.dirname(os.path.abspath(__file__)),
