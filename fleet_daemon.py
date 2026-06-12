@@ -60,7 +60,13 @@ def _parse_toml_minimal(text):
             continue
         if "=" in line and section is not None:
             k, v = (s.strip() for s in line.split("=", 1))
-            v = v.strip().strip('"')
+            v = v.strip()
+            if v == "true":          # bare TOML booleans must become Python
+                v = True             # bools — the string "false" is truthy,
+            elif v == "false":       # which read every agent as disabled
+                v = False
+            else:
+                v = v.strip('"')
             d = out
             for part in section.split("."):
                 d = d[part]
@@ -335,7 +341,9 @@ def daemon_tick(ctx, mono_now, wall_now):
 
     # Respawn dead, non-crashloop children after their backoff delay.
     # Token files stay untouched — the respawned child refreshes its own.
-    for ag in agents.values():
+    for name, ag in agents.items():
+        if cfg["agents"][name].get("disabled"):
+            continue   # disabled: never respawned, never counted as DOWN
         if ag.alive():
             ag.next_spawn_at = None
             continue
@@ -431,8 +439,12 @@ def main():
     for name in cfg["agents"]:
         ag = AgentProc(name, listener_argv(), child_env(name, cfg),
                        os.path.join(log_dir, f"{name}.log"))
-        ag.spawn()
-        print(f"[fleet] spawned @{name} pid {ag.pid}", flush=True)
+        if cfg["agents"][name].get("disabled"):
+            # Tracked (reports DISABLED in telemetry) but never spawned.
+            print(f"[fleet] @{name} disabled — not spawning", flush=True)
+        else:
+            ag.spawn()
+            print(f"[fleet] spawned @{name} pid {ag.pid}", flush=True)
         agents[name] = ag
 
     def _sigterm(signum, frame):

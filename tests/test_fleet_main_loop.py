@@ -71,6 +71,20 @@ class DaemonTickTest(unittest.TestCase):
         ctx = fd.new_ctx(cfg, {}, mono_now=1000.0, wall_now=5000.0)
         self.assertEqual(ctx["fleet_id"], f"testbox-{os.uname().nodename}")
 
+    def test_disabled_agent_never_respawned_never_counted_down(self):
+        agents = {"a": StubProc("a", alive=False)}
+        cfg = make_cfg(agents)
+        cfg["agents"]["a"]["disabled"] = True
+        ctx = fd.new_ctx(cfg, agents, token=None,
+                         state_file=self.state_file,
+                         mono_now=1000.0, wall_now=5000.0)
+        fd.daemon_tick(ctx, mono_now=1001.0, wall_now=5001.0)
+        body = fd.daemon_tick(ctx, mono_now=1030.0, wall_now=5030.0)
+        fd.daemon_tick(ctx, mono_now=1060.0, wall_now=5060.0)
+        self.assertEqual(agents["a"].spawns, 0)            # never respawned
+        self.assertEqual(agents["a"].failure_times, [])    # never counted DOWN
+        self.assertEqual(body["agents"]["a"]["verdict"], "DISABLED")
+
     def test_dead_child_respawned_only_after_backoff_delay(self):
         agents = {"a": StubProc("a", alive=False)}
         ctx = fd.new_ctx(make_cfg(agents), agents, token=None,
@@ -117,3 +131,37 @@ class MainWiringTest(unittest.TestCase):
         expected_dir = os.path.join(home, ".ax", "fleet", "logs")
         self.assertEqual(log_paths["a"], os.path.join(expected_dir, "a.log"))
         self.assertTrue(os.path.isdir(expected_dir))
+
+    def test_main_never_spawns_disabled_agents_but_still_tracks_them(self):
+        home = tempfile.mkdtemp()
+        spawned = []
+
+        class FakeProc:
+            def __init__(self, name, argv, env, log_path):
+                self.name, self.log_path, self.pid = name, log_path, 4242
+
+            def spawn(self):
+                spawned.append(self.name)
+
+        cfg = make_cfg(["a", "b"])
+        cfg["agents"]["b"]["disabled"] = True
+        captured = {}
+        orig_new_ctx = fd.new_ctx
+
+        def capture_ctx(c, agents, **kw):
+            captured["agents"] = agents
+            return orig_new_ctx(c, agents, **kw)
+
+        with mock.patch.dict(os.environ, {"HOME": home}), \
+             mock.patch.object(fd, "AgentProc", FakeProc), \
+             mock.patch.object(fd, "load_fleet_config", lambda path: cfg), \
+             mock.patch.object(fd, "_acquire_singleton_lock", lambda: None), \
+             mock.patch.object(fd, "_load_device_token", lambda: None), \
+             mock.patch.object(fd, "new_ctx", capture_ctx), \
+             mock.patch.object(fd.time, "sleep",
+                               side_effect=KeyboardInterrupt), \
+             mock.patch.object(fd.sys, "argv", ["fleet_daemon.py"]):
+            with self.assertRaises(KeyboardInterrupt):
+                fd.main()
+        self.assertEqual(spawned, ["a"])                      # b never spawned
+        self.assertEqual(set(captured["agents"]), {"a", "b"})  # b still in telemetry

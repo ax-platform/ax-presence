@@ -50,3 +50,29 @@ class FleetConfigTest(unittest.TestCase):
         d = fd._parse_toml_minimal(SAMPLE)
         self.assertEqual(d["fleet"]["device"], "laptop")
         self.assertEqual(d["agents"]["claude_prime"]["catchup"], "ask")
+
+    def test_both_parsers_agree_disabled_is_a_real_boolean(self):
+        # On Python <3.11 the fallback parser used to return the STRING
+        # "false", which is truthy — a 'disabled = false' agent would have
+        # read as disabled. true/false literals must become booleans and
+        # both parsers must agree.
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        sample = (SAMPLE
+                  + "\n[agents.night_owl]\n"
+                  + 'token_file = "~/.ax/night_owl-listener.json"\n'
+                  + "disabled = true\n"
+                  + "\n[agents.spark]\n"
+                  + 'token_file = "~/.ax/spark-listener.json"\n'
+                  + "disabled = false\n")
+        d = fd._parse_toml_minimal(sample)
+        self.assertIs(d["agents"]["night_owl"]["disabled"], True)
+        self.assertIs(d["agents"]["spark"]["disabled"], False)
+        if tomllib:
+            t = tomllib.loads(sample)
+            self.assertEqual(t["agents"]["night_owl"]["disabled"],
+                             d["agents"]["night_owl"]["disabled"])
+            self.assertEqual(t["agents"]["spark"]["disabled"],
+                             d["agents"]["spark"]["disabled"])
