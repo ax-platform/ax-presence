@@ -1,4 +1,4 @@
-import json, os, tempfile, unittest
+import contextlib, io, json, os, tempfile, unittest
 from unittest import mock
 import fleet_daemon as fd
 
@@ -101,6 +101,41 @@ class DaemonTickTest(unittest.TestCase):
         fd.daemon_tick(ctx, mono_now=1003.5, wall_now=5003.5)
         self.assertEqual(agents["a"].spawns, 1)
         self.assertTrue(agents["a"].alive())
+
+
+class RunOneCycleTest(unittest.TestCase):
+    """One daemon_tick exception must NEVER kill the daemon — a dead daemon
+    orphans every child. The loop body (run_one_cycle) catches, logs the
+    traceback to stderr, and the while-True in main() carries on."""
+
+    def test_tick_exception_is_caught_and_logged_not_propagated(self):
+        err = io.StringIO()
+        with mock.patch.object(fd.time, "sleep"), \
+             mock.patch.object(fd, "daemon_tick",
+                               side_effect=RuntimeError("boom from tick")), \
+             contextlib.redirect_stderr(err):
+            fd.run_one_cycle({"fake": "ctx"})   # must not raise
+        out = err.getvalue()
+        self.assertIn("Traceback", out)
+        self.assertIn("RuntimeError: boom from tick", out)
+
+    def test_keyboard_interrupt_still_propagates(self):
+        # Ctrl-C / signal-driven exits must NOT be swallowed by the guard.
+        with mock.patch.object(fd.time, "sleep"), \
+             mock.patch.object(fd, "daemon_tick",
+                               side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                fd.run_one_cycle({"fake": "ctx"})
+
+    def test_healthy_cycle_sleeps_then_ticks_with_real_clocks(self):
+        calls = []
+        with mock.patch.object(fd.time, "sleep",
+                               side_effect=lambda s: calls.append(("sleep", s))), \
+             mock.patch.object(fd, "daemon_tick",
+                               side_effect=lambda ctx, m, w:
+                                   calls.append(("tick", ctx))):
+            fd.run_one_cycle({"k": "v"})
+        self.assertEqual(calls, [("sleep", fd.TICK_S), ("tick", {"k": "v"})])
 
 
 class MainWiringTest(unittest.TestCase):

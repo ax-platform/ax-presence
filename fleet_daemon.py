@@ -6,6 +6,7 @@ Invariants: never touch child token files (read-only TTL checks only);
 one process per agent; never set AX_SPACE_ID in child env.
 """
 import argparse, json, os, shlex, sys, time, threading, subprocess, signal, fcntl
+import traceback
 import urllib.request, urllib.error
 
 try:
@@ -497,6 +498,22 @@ def _load_device_token():
     return token
 
 
+def run_one_cycle(ctx):
+    """One supervision cycle: sleep TICK_S, then one daemon_tick. A tick
+    exception (one malformed child file, one bad read) must NEVER kill the
+    daemon — a dead daemon orphans every child — so it is caught and logged
+    with its traceback to stderr, and main()'s while-True carries on.
+    KeyboardInterrupt/SystemExit (BaseException) still propagate: clean
+    shutdown paths are not swallowed."""
+    time.sleep(TICK_S)
+    try:
+        daemon_tick(ctx, time.monotonic(), time.time())
+    except Exception:
+        print("[fleet] daemon_tick raised — daemon continues:",
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+
+
 def main():
     ap = argparse.ArgumentParser(description="ax-presence fleet daemon")
     ap.add_argument("--config", default=os.path.expanduser("~/.ax/fleet.toml"))
@@ -528,8 +545,7 @@ def main():
 
     ctx = new_ctx(cfg, agents, token=_load_device_token())
     while True:
-        time.sleep(TICK_S)
-        daemon_tick(ctx, time.monotonic(), time.time())
+        run_one_cycle(ctx)
 
 
 if __name__ == "__main__":
