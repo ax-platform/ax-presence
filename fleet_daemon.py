@@ -5,7 +5,7 @@ Spec: docs/plans/2026-06-12-fleet-daemon-design.md (Phase 1).
 Invariants: never touch child token files (read-only TTL checks only);
 one process per agent; never set AX_SPACE_ID in child env.
 """
-import json, os, sys, time, threading, subprocess, signal, fcntl
+import argparse, json, os, sys, time, threading, subprocess, signal, fcntl
 import urllib.request, urllib.error
 
 try:
@@ -25,6 +25,11 @@ TOKEN_WEDGE_S = -600          # expired this long with child alive = wedged
 DEAF_THRESHOLD_S = 1800       # uniform start; tune from soak data (spec §11.4)
 
 TELEMETRY_EVENT_CAP = 50
+
+DAEMON_VERSION = "0.1.0"
+TICK_S = 15                   # daemon_tick cadence (spec §3 watchdog table)
+TELEMETRY_EVERY = 2           # every 2nd tick = 30s telemetry beat (spec §7)
+RESUME_GRACE_S = 60           # post-resume alert grace window (spec §3)
 
 # Per-agent identity/state vars the listener binds from its environment
 # (ax_presence_listener.py). Any of these inherited from the daemon's own
@@ -256,3 +261,149 @@ def build_telemetry(fleet, fleet_id, daemon_version, seq, sent_at,
         "events": list(events)[-TELEMETRY_EVENT_CAP:],
         "commands_ack": [],
     }
+
+
+def new_ctx(cfg, agents, token=None, state_file=None, base=None,
+            mono_now=None, wall_now=None):
+    """Mutable per-daemon state threaded through daemon_tick."""
+    fleet = cfg["fleet"]
+    return {
+        "cfg": cfg, "agents": agents, "token": token,
+        "base": base or os.environ.get("AX_BASE", "https://paxai.app"),
+        "state_file": state_file or os.path.expanduser("~/.ax/fleet-state.json"),
+        "fleet_id": fleet.get("fleet_id") or
+                    f"{fleet.get('device', 'unknown')}-{os.uname().nodename}",
+        "suspend": {"mono": time.monotonic() if mono_now is None else mono_now,
+                    "wall": time.time() if wall_now is None else wall_now},
+        "mono_start": time.monotonic() if mono_now is None else mono_now,
+        "tick": 0, "seq": 0, "grace_until": 0.0, "events": [],
+    }
+
+
+def daemon_tick(ctx, mono_now, wall_now):
+    """One 15s supervision pass — pure wiring of the already-tested pieces
+    (same injectable-clock tick design as suspend_tick). Returns the
+    telemetry body on sending ticks, else None."""
+    cfg, agents = ctx["cfg"], ctx["agents"]
+    ctx["tick"] += 1
+
+    # Suspend -> nudge every alive child once, open the alert grace window,
+    # queue exactly ONE suspend_resumed event for the next telemetry beat.
+    ev = suspend_tick(ctx["suspend"], mono_now, wall_now)
+    if ev:
+        ctx["grace_until"] = wall_now + RESUME_GRACE_S
+        ctx["events"].append({"kind": "suspend_resumed", "for_s": ev["for_s"],
+                              "nudged": wake_fanout(list(agents.values()))})
+    in_grace = wall_now < ctx["grace_until"]
+
+    # Respawn dead, non-crashloop children after their backoff delay.
+    # Token files stay untouched — the respawned child refreshes its own.
+    for ag in agents.values():
+        if ag.alive():
+            ag.next_spawn_at = None
+            continue
+        if is_crashloop(ag.failure_times, wall_now):
+            continue
+        if getattr(ag, "next_spawn_at", None) is None:
+            ag.failure_times.append(wall_now)
+            ag.next_spawn_at = wall_now + respawn_delay(len(ag.failure_times))
+        if wall_now >= ag.next_spawn_at:
+            ag.spawn()
+            ag.next_spawn_at = None
+
+    # Fresh snapshots (token_ttl read-only, last_receipt_age, alive) -> verdicts.
+    snaps = {}
+    for name, ag in agents.items():
+        a = cfg["agents"][name]
+        s = {"alive": ag.alive(), "disabled": bool(a.get("disabled")),
+             "crashloop": is_crashloop(ag.failure_times, wall_now),
+             "token_ttl_s": token_ttl(a["token_file"], wall_now),
+             "receipt_age_s": last_receipt_age(ag.log_path, wall_now)}
+        v = verdict(s)
+        if in_grace and v == "DEAF":
+            v = "OK"   # stale receipts are expected right after resume (spec §3)
+        snaps[name] = {"verdict": v, "alive": s["alive"],
+                       "pid": ag.pid if s["alive"] else None,
+                       "token_ttl_s": s["token_ttl_s"],
+                       "last_receipt_age_s": s["receipt_age_s"]}
+
+    if ctx["tick"] % TELEMETRY_EVERY:
+        return None
+    ctx["seq"] += 1
+    body = build_telemetry(
+        cfg["fleet"], ctx["fleet_id"], DAEMON_VERSION, ctx["seq"],
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall_now)),
+        {"status": "active", "uptime_s": int(mono_now - ctx["mono_start"]),
+         "host": {"os": sys.platform}},
+        snaps, ctx["events"])
+    post_telemetry(body, ctx["base"], ctx["token"])
+    write_state_file(ctx["state_file"], body)
+    ctx["events"].clear()   # each event ships exactly once
+    return body
+
+
+_LOCK_FH = None
+def _acquire_singleton_lock():
+    """One fleet daemon per device — same flock pattern as the listener's
+    per-handle lock (ax_presence_listener.py _acquire_singleton_lock):
+    flock auto-releases on process death, so a crash frees the lock."""
+    global _LOCK_FH
+    lock_path = os.path.expanduser("~/.ax/fleet-daemon.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"[fleet] another fleet daemon already holds {lock_path} — "
+              "refusing to start a second. Exiting.", flush=True)
+        sys.exit(0)
+    fh.write(str(os.getpid())); fh.flush()
+    _LOCK_FH = fh
+
+
+def _load_device_token():
+    """Static device bearer for telemetry POSTs, read ONCE at startup from
+    AX_FLEET_TOKEN_FILE (mechanism is nyx's open question, spec §11.3).
+    No token => local-only mode: state file only, zero network I/O."""
+    path = os.environ.get("AX_FLEET_TOKEN_FILE")
+    try:
+        token = open(path).read().strip() if path else None
+    except OSError:
+        token = None
+    if not token:
+        print("[fleet] no device token — local-only mode (state file, no "
+              "telemetry POSTs)", flush=True)
+    return token
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ax-presence fleet daemon")
+    ap.add_argument("--config", default=os.path.expanduser("~/.ax/fleet.toml"))
+    args = ap.parse_args()
+    _acquire_singleton_lock()
+    cfg = load_fleet_config(args.config)
+    log_dir = os.path.expanduser("~/.ax/logs")
+    os.makedirs(log_dir, mode=0o700, exist_ok=True)
+    agents = {}
+    for name in cfg["agents"]:
+        ag = AgentProc(name, listener_argv(), child_env(name, cfg),
+                       os.path.join(log_dir, f"{name}.log"))
+        ag.spawn()
+        print(f"[fleet] spawned @{name} pid {ag.pid}", flush=True)
+        agents[name] = ag
+
+    def _sigterm(signum, frame):
+        print("[fleet] SIGTERM — terminating children, exiting", flush=True)
+        for ag in agents.values():
+            ag.terminate()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
+
+    ctx = new_ctx(cfg, agents, token=_load_device_token())
+    while True:
+        time.sleep(TICK_S)
+        daemon_tick(ctx, time.monotonic(), time.time())
+
+
+if __name__ == "__main__":
+    main()
