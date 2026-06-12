@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import unittest
 from unittest import mock
 
@@ -42,7 +43,7 @@ class AXPresencePostMessageTest(unittest.TestCase):
                 return _Response(b"{}")
             raise AssertionError(f"unexpected url {req.full_url}")
 
-        with mock.patch.object(listener, "load_tok", return_value={"access_token": "token"}), \
+        with mock.patch.object(listener, "load_tok", return_value={"access_token": "token", "expires_at": time.time() + 900}), \
              mock.patch.object(listener.urllib.request, "urlopen", side_effect=fake_urlopen):
             mid = listener.post_message("hello", parent_id="parent-1", space_id="space-1")
 
@@ -62,7 +63,7 @@ class AXPresencePostMessageTest(unittest.TestCase):
                 return _Response(json.dumps({"messages": []}).encode())
             raise AssertionError(f"unexpected url {req.full_url}")
 
-        with mock.patch.object(listener, "load_tok", return_value={"access_token": "token"}), \
+        with mock.patch.object(listener, "load_tok", return_value={"access_token": "token", "expires_at": time.time() + 900}), \
              mock.patch.object(listener.urllib.request, "urlopen", side_effect=fake_urlopen):
             mid = listener.post_message("hello", parent_id="parent-1", space_id="space-1")
 
