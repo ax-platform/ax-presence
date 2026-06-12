@@ -356,6 +356,36 @@ def keeper(mid, stop):
     _pending.pop(mid, None)
 
 
+_wake_requested = False
+
+
+def _handle_wake_signal(signum, frame):
+    """SIGUSR1 from the fleet daemon: host woke from suspend. Only set a
+    flag here (signal-handler safety); loops consume it."""
+    globals()["_wake_requested"] = True
+
+
+def _consume_wake_request():
+    if _wake_requested:
+        globals()["_wake_requested"] = False
+        return True
+    return False
+
+
+def _presence_beat():
+    """One platform heartbeat POST. On a fleet wake (SIGUSR1) force a token
+    refresh first — the child owns its refresh path; the daemon never touches
+    token files — so the first post-suspend beat carries a verified token."""
+    if _consume_wake_request():
+        at = refresh()["access_token"]
+    else:
+        at = load_tok().get("access_token")
+    req = urllib.request.Request(HEARTBEAT_URL, data=b"{}",
+        headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
+                 "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID})
+    urllib.request.urlopen(req, timeout=10)
+
+
 def presence_loop():
     derive_space_id_from_agent_record()
     """Publish liveness to the PLATFORM: POST /api/v1/agents/heartbeat every ~20s
@@ -365,11 +395,7 @@ def presence_loop():
     Calling this is what makes an agent discoverable as alive."""
     while True:
         try:
-            at = load_tok().get("access_token")
-            req = urllib.request.Request(HEARTBEAT_URL, data=b"{}",
-                headers={"Authorization": "Bearer " + at, "Content-Type": "application/json",
-                         "X-Agent-Id": AGENT_ID, "X-Space-Id": SPACE_ID})
-            urllib.request.urlopen(req, timeout=10)
+            _presence_beat()
         except Exception as e:
             print(f"[listener] platform heartbeat failed: {e!r}", file=sys.stderr, flush=True)
         time.sleep(20)
@@ -646,6 +672,12 @@ def stream():
     print(f"[status] SSE connected, watching for @{AGENT_HANDLE} mentions", flush=True)
     event = None
     for raw in r:
+        if _wake_requested:
+            # Fleet wake (SIGUSR1): break to the reconnect path so the SSE
+            # connection is re-established post-suspend; the presence beat
+            # consumes the flag and re-verifies the token.
+            print("[status] wake signal — forcing SSE reconnect", flush=True)
+            break
         line = raw.decode("utf-8", "replace").rstrip("\n")
         if line.startswith("event:"):
             event = line[6:].strip()
@@ -726,6 +758,10 @@ def _install_exit_alert():
             signal.signal(sig, lambda s, f: (_exit_alert(f"signal {s}"), sys.exit(0)))
         except Exception:
             pass
+    try:
+        signal.signal(signal.SIGUSR1, _handle_wake_signal)  # fleet daemon wake
+    except Exception:
+        pass
 
 
 def selftest():
