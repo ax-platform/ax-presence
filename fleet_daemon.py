@@ -167,6 +167,57 @@ def verdict(s):
     return "OK"
 
 
+class AgentProc:
+    def __init__(self, name, argv, env, log_path):
+        self.name, self.argv, self.env, self.log_path = name, argv, env, log_path
+        self.proc, self.pid = None, None
+        self.failure_times = []
+
+    def spawn(self):
+        logf = open(self.log_path, "ab")
+        self.proc = subprocess.Popen(
+            self.argv, env=self.env, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=True)
+        self.pid = self.proc.pid
+        threading.Thread(target=self._pump, args=(logf,), daemon=True).start()
+
+    def _pump(self, logf):
+        for raw in self.proc.stdout:
+            line = stamp_line(raw.decode(errors="replace").rstrip("\n"), time.time())
+            logf.write(line.encode() + b"\n"); logf.flush()
+        logf.close()
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def signal_wake(self):
+        os.kill(self.pid, signal.SIGUSR1)
+
+    def terminate(self):
+        if self.alive():
+            self.proc.terminate()
+
+
+def wake_fanout(agents):
+    """Post-suspend: nudge every alive child to re-verify its token and
+    reconnect (child-owned refresh — daemon never touches token files).
+    Returns names nudged; dead children are the process watchdog's job."""
+    nudged = []
+    for ag in agents:
+        if ag.alive():
+            try:
+                ag.signal_wake(); nudged.append(ag.name)
+            except OSError:
+                pass
+    return nudged
+
+
+def listener_argv():
+    return [sys.executable, "-u",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "ax_presence_listener.py")]
+
+
 def build_telemetry(fleet, fleet_id, daemon_version, seq, sent_at,
                     device_state, agent_snaps, events):
     """Assemble the §7 telemetry body (frozen contract — golden fixture
