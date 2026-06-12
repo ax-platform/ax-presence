@@ -361,8 +361,8 @@ def keeper(mid, stop):
 # stream() ever saw it, and vice versa).
 _wake_requested = False    # consumed by _presence_beat(): force a token refresh
 _wake_reconnect = False    # consumed by stream(): classify the forced reconnect
-_sse_response = None       # live SSE response, stashed by stream()
-_sse_socket = None         # its underlying socket — the wake shutdown target
+_sse_socket = None         # live SSE socket, stashed by stream() — the wake
+                           # shutdown target
 
 
 def _sse_socket_of(r):
@@ -708,11 +708,11 @@ def stream():
         "Accept": "text/event-stream",
     })
     r = urllib.request.urlopen(req, timeout=None)
-    # Stash for the SIGUSR1 wake handler, which shuts the SOCKET down to break
-    # a read blocked on a half-open post-suspend socket (the only way out: the
-    # read has no timeout, PEP 475 retries it straight through a mere flag,
-    # and close() from the handler trips the BufferedReader reentrancy guard).
-    globals()["_sse_response"] = r
+    # Stash the SOCKET for the SIGUSR1 wake handler, which shuts it down to
+    # break a read blocked on a half-open post-suspend socket (the only way
+    # out: the read has no timeout, PEP 475 retries it straight through a mere
+    # flag, and close() from the handler trips the BufferedReader reentrancy
+    # guard).
     globals()["_sse_socket"] = _sse_socket_of(r)
     # A wake that fired while we were disconnected is already satisfied by
     # this fresh connection — drop the stale request so a later genuine read

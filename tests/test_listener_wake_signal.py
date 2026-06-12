@@ -120,7 +120,6 @@ class WakeRaceFixTest(unittest.TestCase):
     def setUp(self):
         listener._wake_requested = False
         listener._wake_reconnect = False
-        listener._sse_response = None
         listener._sse_socket = None
 
     def _stream(self, resp):
@@ -143,7 +142,6 @@ class WakeRaceFixTest(unittest.TestCase):
         # shutdown() the stashed SOCKET — no io lock involved — so the blocked
         # recv returns EOF and the read terminates.
         resp = _FakeSSE()
-        listener._sse_response = resp
         listener._sse_socket = resp.sock
         listener._handle_wake_signal(signal.SIGUSR1, None)
         self.assertEqual(resp.sock.shutdown_calls, [socket.SHUT_RDWR])
@@ -156,13 +154,11 @@ class WakeRaceFixTest(unittest.TestCase):
         # bare except, leaving the listener wedged.
         resp = _FakeSSE()
         resp._reading = True
-        listener._sse_response = resp
         listener._sse_socket = resp.sock
         listener._handle_wake_signal(signal.SIGUSR1, None)  # must not raise
         self.assertTrue(resp.sock.shut)
 
     def test_handler_tolerates_no_stashed_response(self):
-        listener._sse_response = None
         listener._sse_socket = None
         listener._handle_wake_signal(signal.SIGUSR1, None)  # must not raise
         self.assertTrue(listener._wake_requested)
@@ -175,10 +171,12 @@ class WakeRaceFixTest(unittest.TestCase):
         listener._handle_wake_signal(signal.SIGUSR1, None)  # must not raise
         self.assertTrue(listener._wake_requested)
 
-    def test_stream_stashes_response_for_wake_close(self):
+    def test_stream_stashes_only_the_socket_no_response_global(self):
+        # The wake handler targets the SOCKET; a stashed response object was
+        # write-only state (removed in review). Only _sse_socket remains.
         resp = _FakeSSE()
         self._stream(resp)
-        self.assertIs(listener._sse_response, resp)
+        self.assertFalse(hasattr(listener, "_sse_response"))
 
     def test_stream_stashes_underlying_socket_for_wake_shutdown(self):
         # stream() must dig the socket out at connect time (fp.raw._sock, the
@@ -268,7 +266,6 @@ class WakeRealSocketTest(unittest.TestCase):
         self.addCleanup(rf.close)
         listener._wake_requested = False
         listener._wake_reconnect = False
-        listener._sse_response = None
         listener._sse_socket = a
         self.addCleanup(setattr, listener, "_sse_socket", None)
         # Watchdog: if the wake fails to break the read, feed real bytes so
