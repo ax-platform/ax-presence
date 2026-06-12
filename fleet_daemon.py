@@ -103,14 +103,30 @@ def heartbeat_path(name, a):
         a.get("heartbeat_file", f"~/.ax/{name}-listener-heartbeat"))
 
 
+def signal_path(name, a):
+    """Where agent `name`'s listener writes its rich per-agent signal dict
+    (connected/currently_401/mentions_seen/replies_sent/...). Must derive
+    the path EXACTLY like the listener's hardcoded write
+    (ax_presence_listener.py heartbeat_loop: ~/.ax/{AGENT_HANDLE}-signal.json)
+    or the daemon reads a file nobody writes. Per-agent `signal_file`
+    overrides, mirroring heartbeat_file."""
+    return os.path.expanduser(a.get("signal_file", f"~/.ax/{name}-signal.json"))
+
+
 def read_heartbeat(path):
-    """READ-ONLY view of a child's heartbeat signal file — the listener-owned
-    fields the §7 telemetry contract carries per agent. Missing/unreadable
-    file (child never started, non-ax platform) => all-None, never an error."""
+    """READ-ONLY view of a child-written signal file — the listener-owned
+    fields the §7 telemetry contract carries per agent. The REAL listener
+    writes a BARE INT epoch to the heartbeat file (ax_presence_listener.py
+    heartbeat_loop: f.write(str(int(time.time())))) and the rich dict to the
+    signal file, so ANY non-dict content (bare int, missing file, garbage,
+    child never started, non-ax platform) => all-None fields, never an error
+    — a malformed child file must not be able to kill the daemon."""
     try:
         with open(path) as f:
             hb = json.load(f)
     except Exception:
+        hb = None
+    if not isinstance(hb, dict):
         hb = {}
     return {"sse_connected": hb.get("connected"),
             "mentions_seen": hb.get("mentions_seen"),
@@ -416,7 +432,12 @@ def daemon_tick(ctx, mono_now, wall_now):
                           f"times in {CRASHLOOP_WINDOW_S}s — respawns held, "
                           "manual attention needed")
 
-        hb = read_heartbeat(heartbeat_path(name, a))
+        # Rich fields live in the SIGNAL file (the real listener's heartbeat
+        # file is just a bare-int liveness epoch); legacy dict-format
+        # heartbeat files still fill any field the signal file doesn't.
+        sig = read_heartbeat(signal_path(name, a))
+        legacy = read_heartbeat(heartbeat_path(name, a))
+        hb = {k: legacy[k] if sig[k] is None else sig[k] for k in sig}
         snaps[name] = {"verdict": v,
                        "pid": ag.pid if s["alive"] else None,
                        "sse_connected": hb["sse_connected"],
