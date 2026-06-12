@@ -121,3 +121,26 @@ def token_ttl(token_file, now):
             return int(json.load(f).get("expires_at", 0) - now)
     except Exception:
         return None
+
+
+def stamp_line(line, now):
+    return f"{int(now)} {line}"
+
+
+def last_receipt_age(log_path, now, _tail_bytes=262_144):
+    """Newest inbound receipt (NOTIFY line) age in seconds, or None.
+    Receipt-as-truth: this — not sse_connected — is what proves the
+    listener actually consumes mentions (fleet-doctor lesson)."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - _tail_bytes))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    newest = None
+    for line in tail.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2 and parts[1].startswith("NOTIFY ") and parts[0].isdigit():
+            newest = int(parts[0])
+    return None if newest is None else int(now - newest)
