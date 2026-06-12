@@ -1,4 +1,5 @@
 import json, os, tempfile, unittest
+from unittest import mock
 import fleet_daemon as fd
 
 
@@ -61,6 +62,15 @@ class DaemonTickTest(unittest.TestCase):
         self.assertEqual([e for e in body["events"]
                           if e["kind"] == "suspend_resumed"], [])
 
+    def test_fleet_id_is_always_derived_device_plus_nodename(self):
+        # fleet_id is a build_telemetry PARAMETER, not a fleet.toml key
+        # (Task 1 schema has no [fleet] fleet_id) — a stray config key
+        # must not override the derived device-nodename identity.
+        cfg = make_cfg(["a"])
+        cfg["fleet"]["fleet_id"] = "rogue-config-override"
+        ctx = fd.new_ctx(cfg, {}, mono_now=1000.0, wall_now=5000.0)
+        self.assertEqual(ctx["fleet_id"], f"testbox-{os.uname().nodename}")
+
     def test_dead_child_respawned_only_after_backoff_delay(self):
         agents = {"a": StubProc("a", alive=False)}
         ctx = fd.new_ctx(make_cfg(agents), agents, token=None,
@@ -77,3 +87,33 @@ class DaemonTickTest(unittest.TestCase):
         fd.daemon_tick(ctx, mono_now=1003.5, wall_now=5003.5)
         self.assertEqual(agents["a"].spawns, 1)
         self.assertTrue(agents["a"].alive())
+
+
+class MainWiringTest(unittest.TestCase):
+    def test_main_wires_child_logs_under_fleet_logs(self):
+        # Plan Task 7: child capture logs live at ~/.ax/fleet/logs/<agent>.log.
+        home = tempfile.mkdtemp()
+        log_paths = {}
+
+        class FakeProc:
+            def __init__(self, name, argv, env, log_path):
+                self.name, self.log_path, self.pid = name, log_path, 4242
+                log_paths[name] = log_path
+
+            def spawn(self):
+                pass
+
+        cfg = make_cfg(["a"])
+        with mock.patch.dict(os.environ, {"HOME": home}), \
+             mock.patch.object(fd, "AgentProc", FakeProc), \
+             mock.patch.object(fd, "load_fleet_config", lambda path: cfg), \
+             mock.patch.object(fd, "_acquire_singleton_lock", lambda: None), \
+             mock.patch.object(fd, "_load_device_token", lambda: None), \
+             mock.patch.object(fd.time, "sleep",
+                               side_effect=KeyboardInterrupt), \
+             mock.patch.object(fd.sys, "argv", ["fleet_daemon.py"]):
+            with self.assertRaises(KeyboardInterrupt):
+                fd.main()
+        expected_dir = os.path.join(home, ".ax", "fleet", "logs")
+        self.assertEqual(log_paths["a"], os.path.join(expected_dir, "a.log"))
+        self.assertTrue(os.path.isdir(expected_dir))

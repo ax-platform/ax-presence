@@ -271,8 +271,7 @@ def new_ctx(cfg, agents, token=None, state_file=None, base=None,
         "cfg": cfg, "agents": agents, "token": token,
         "base": base or os.environ.get("AX_BASE", "https://paxai.app"),
         "state_file": state_file or os.path.expanduser("~/.ax/fleet-state.json"),
-        "fleet_id": fleet.get("fleet_id") or
-                    f"{fleet.get('device', 'unknown')}-{os.uname().nodename}",
+        "fleet_id": f"{fleet.get('device', 'unknown')}-{os.uname().nodename}",
         "suspend": {"mono": time.monotonic() if mono_now is None else mono_now,
                     "wall": time.time() if wall_now is None else wall_now},
         "mono_start": time.monotonic() if mono_now is None else mono_now,
@@ -382,7 +381,7 @@ def main():
     args = ap.parse_args()
     _acquire_singleton_lock()
     cfg = load_fleet_config(args.config)
-    log_dir = os.path.expanduser("~/.ax/logs")
+    log_dir = os.path.expanduser("~/.ax/fleet/logs")
     os.makedirs(log_dir, mode=0o700, exist_ok=True)
     agents = {}
     for name in cfg["agents"]:
