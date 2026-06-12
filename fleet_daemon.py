@@ -5,7 +5,7 @@ Spec: docs/plans/2026-06-12-fleet-daemon-design.md (Phase 1).
 Invariants: never touch child token files (read-only TTL checks only);
 one process per agent; never set AX_SPACE_ID in child env.
 """
-import argparse, json, os, sys, time, threading, subprocess, signal, fcntl
+import argparse, json, os, shlex, sys, time, threading, subprocess, signal, fcntl
 import urllib.request, urllib.error
 
 try:
@@ -308,7 +308,24 @@ def new_ctx(cfg, agents, token=None, state_file=None, base=None,
         "mono_start": time.monotonic() if mono_now is None else mono_now,
         "tick": 0, "seq": 0, "grace_until": 0.0, "events": [],
         "last_suspend": None,
+        "episodes": {},   # per-agent in-flight verdict episodes (one
+                          # bounce/alert per episode, cleared on healthy)
     }
+
+
+def alert_sponsor(fleet, msg):
+    """CRASHLOOP alert hook: run the optional [fleet] alert_cmd with the
+    message appended as the last argv. Platform-agnostic by design (spec §9
+    — never imports listener/ax code); unset => log only."""
+    cmd = fleet.get("alert_cmd")
+    if not cmd:
+        print(f"[fleet] ALERT (no alert_cmd configured): {msg}", flush=True)
+        return
+    try:
+        subprocess.run(shlex.split(cmd) + [msg], timeout=30, check=False)
+    except Exception as e:
+        print(f"[fleet] alert_cmd failed: {e!r} — message was: {msg}",
+              flush=True)
 
 
 def _host_load():
@@ -367,6 +384,29 @@ def daemon_tick(ctx, mono_now, wall_now):
         v = verdict(s)
         if in_grace and v == "DEAF":
             v = "OK"   # stale receipts are expected right after resume (spec §3)
+
+        # Watchdog ACTIONS (spec §3), at most one per agent per episode.
+        # An episode flag clears only when the agent is healthy again
+        # (OK/QUIET) — the bounce's own DOWN->respawn->still-stale arc never
+        # re-triggers. Token files stay untouched: a bounce just terminates;
+        # the respawned child runs its own refresh path.
+        ep = ctx["episodes"].setdefault(name, set())
+        if v in ("OK", "QUIET"):
+            ep.clear()
+        elif v in ("DEAF", "TOKEN") and v not in ep:
+            ep.add(v)
+            print(f"[fleet] bounce @{name}: verdict {v} — terminating child; "
+                  "respawn-with-backoff restarts it", flush=True)
+            ag.terminate()
+            ctx["events"].append({"kind": "bounce", "agent": name, "reason": v})
+            s["alive"] = False
+        elif v == "CRASHLOOP" and v not in ep:
+            ep.add(v)
+            alert_sponsor(cfg["fleet"],
+                          f"[fleet] CRASHLOOP: @{name} exited {CRASHLOOP_N}+ "
+                          f"times in {CRASHLOOP_WINDOW_S}s — respawns held, "
+                          "manual attention needed")
+
         hb = read_heartbeat(heartbeat_path(name, a))
         snaps[name] = {"verdict": v,
                        "pid": ag.pid if s["alive"] else None,
