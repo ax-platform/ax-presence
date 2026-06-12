@@ -107,6 +107,23 @@ class WatchdogActionsTest(unittest.TestCase):
         fd.daemon_tick(ctx, mono_now=1090.0, wall_now=5090.0)
         self.assertEqual(ag.terminates, 2)
 
+    def test_post_resume_grace_suppresses_token_bounce(self):
+        # Right after resume the child's SIGUSR1 refresh needs time to land:
+        # a long-expired token inside the grace window is expected, not a
+        # wedge — no bounce until the window closes.
+        self._write_log(["4990 NOTIFY @a mention"])
+        self._write_token(expires_at=4300)            # 700s past => wedged
+        ctx = self._ctx(token_file=self.tok)
+        ctx["grace_until"] = 5100.0                   # post-resume window open
+        fd.daemon_tick(ctx, mono_now=1015.0, wall_now=5015.0)
+        self.assertEqual(self.agents["a"].terminates, 0)
+        body = fd.daemon_tick(ctx, mono_now=1030.0, wall_now=5030.0)
+        self.assertEqual([e for e in body["events"] if e["kind"] == "bounce"],
+                         [])
+        # Window closed and STILL wedged: now it bounces.
+        fd.daemon_tick(ctx, mono_now=1115.0, wall_now=5115.0)
+        self.assertEqual(self.agents["a"].terminates, 1)
+
     def test_crashloop_alerts_sponsor_once_per_episode_via_alert_cmd(self):
         ctx = self._ctx(fleet_extra={"alert_cmd": "notify-send fleet"})
         ag = self.agents["a"]

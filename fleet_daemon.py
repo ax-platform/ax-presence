@@ -382,8 +382,11 @@ def daemon_tick(ctx, mono_now, wall_now):
              "token_ttl_s": token_ttl(a["token_file"], wall_now),
              "receipt_age_s": last_receipt_age(ag.log_path, wall_now)}
         v = verdict(s)
-        if in_grace and v == "DEAF":
-            v = "OK"   # stale receipts are expected right after resume (spec §3)
+        if in_grace and v in ("DEAF", "TOKEN"):
+            # Stale receipts AND long-expired tokens are expected right after
+            # resume (spec §3): the child's SIGUSR1-driven refresh/reconnect
+            # needs the grace window to land before either may bounce it.
+            v = "OK"
 
         # Watchdog ACTIONS (spec §3), at most one per agent per episode.
         # An episode flag clears only when the agent is healthy again
