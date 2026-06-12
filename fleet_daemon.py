@@ -82,6 +82,30 @@ def load_fleet_config(path):
     return {"fleet": data.get("fleet", {}), "agents": agents}
 
 
+def heartbeat_path(name, a):
+    """Where agent `name`'s listener writes its heartbeat signal file.
+    The daemon injects this into the child env AND reads it for telemetry,
+    so child and daemon provably agree on the path (spec §9: the daemon
+    talks to children via process lifecycle, signal files, and logs)."""
+    return os.path.expanduser(
+        a.get("heartbeat_file", f"~/.ax/{name}-listener-heartbeat"))
+
+
+def read_heartbeat(path):
+    """READ-ONLY view of a child's heartbeat signal file — the listener-owned
+    fields the §7 telemetry contract carries per agent. Missing/unreadable
+    file (child never started, non-ax platform) => all-None, never an error."""
+    try:
+        with open(path) as f:
+            hb = json.load(f)
+    except Exception:
+        hb = {}
+    return {"sse_connected": hb.get("connected"),
+            "mentions_seen": hb.get("mentions_seen"),
+            "replies_sent": hb.get("replies_sent"),
+            "currently_401": hb.get("currently_401")}
+
+
 def child_env(name, cfg):
     """Build the child listener's environment. NEVER sets AX_SPACE_ID —
     the child derives its space from its agent record (bug 80588cba) —
@@ -94,6 +118,7 @@ def child_env(name, cfg):
     env.update({
         "AX_AGENT_HANDLE": name,
         "AX_TOKEN_FILE": a["token_file"],
+        "AX_HEARTBEAT_FILE": heartbeat_path(name, a),
         "AX_SPONSOR": cfg["fleet"].get("sponsor", "@your-sponsor"),
     })
     return env
@@ -276,7 +301,16 @@ def new_ctx(cfg, agents, token=None, state_file=None, base=None,
                     "wall": time.time() if wall_now is None else wall_now},
         "mono_start": time.monotonic() if mono_now is None else mono_now,
         "tick": 0, "seq": 0, "grace_until": 0.0, "events": [],
+        "last_suspend": None,
     }
+
+
+def _host_load():
+    """1-minute load average, or None where unavailable."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        return None
 
 
 def daemon_tick(ctx, mono_now, wall_now):
@@ -291,6 +325,10 @@ def daemon_tick(ctx, mono_now, wall_now):
     ev = suspend_tick(ctx["suspend"], mono_now, wall_now)
     if ev:
         ctx["grace_until"] = wall_now + RESUME_GRACE_S
+        ctx["last_suspend"] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                time.gmtime(wall_now - ev["for_s"])),
+            "for_s": ev["for_s"]}
         ctx["events"].append({"kind": "suspend_resumed", "for_s": ev["for_s"],
                               "nudged": wake_fanout(list(agents.values()))})
     in_grace = wall_now < ctx["grace_until"]
@@ -321,10 +359,15 @@ def daemon_tick(ctx, mono_now, wall_now):
         v = verdict(s)
         if in_grace and v == "DEAF":
             v = "OK"   # stale receipts are expected right after resume (spec §3)
-        snaps[name] = {"verdict": v, "alive": s["alive"],
+        hb = read_heartbeat(heartbeat_path(name, a))
+        snaps[name] = {"verdict": v,
                        "pid": ag.pid if s["alive"] else None,
+                       "sse_connected": hb["sse_connected"],
+                       "last_receipt_age_s": s["receipt_age_s"],
                        "token_ttl_s": s["token_ttl_s"],
-                       "last_receipt_age_s": s["receipt_age_s"]}
+                       "mentions_seen": hb["mentions_seen"],
+                       "replies_sent": hb["replies_sent"],
+                       "currently_401": hb["currently_401"]}
 
     if ctx["tick"] % TELEMETRY_EVERY:
         return None
@@ -333,7 +376,8 @@ def daemon_tick(ctx, mono_now, wall_now):
         cfg["fleet"], ctx["fleet_id"], DAEMON_VERSION, ctx["seq"],
         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall_now)),
         {"status": "active", "uptime_s": int(mono_now - ctx["mono_start"]),
-         "host": {"os": sys.platform}},
+         "last_suspend": ctx["last_suspend"],
+         "host": {"os": sys.platform, "load": _host_load()}},
         snaps, ctx["events"])
     post_telemetry(body, ctx["base"], ctx["token"])
     write_state_file(ctx["state_file"], body)

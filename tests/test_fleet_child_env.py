@@ -30,7 +30,6 @@ class ChildEnvTest(unittest.TestCase):
         # guards, and heartbeat/activity files from these.
         stale = {
             "AX_AGENT_ID": "stale-uuid",
-            "AX_HEARTBEAT_FILE": "/stale/heartbeat",
             "AX_ACTIVITY_FILE": "/stale/activity",
             "AX_ACTIVITY_JSON_FILE": "/stale/activity.json",
             "AX_REMINDERS_FILE": "/stale/reminders.json",
@@ -55,3 +54,20 @@ class ChildEnvTest(unittest.TestCase):
     def test_inherits_parent_env_without_leaking_other_agents(self):
         env = fd.child_env("claude_prime", CFG)
         self.assertIn("PATH", env)
+
+    def test_heartbeat_file_injected_so_daemon_and_child_agree(self):
+        # The daemon reads the child's heartbeat signal file for telemetry
+        # (sse_connected / counters), so the path must be EXPLICIT in the
+        # child env — never inherited (stale paths cross-wire agents) and
+        # never left to implicit default agreement.
+        with mock.patch.dict(os.environ, {"AX_HEARTBEAT_FILE": "/stale/hb"}):
+            env = fd.child_env("claude_prime", CFG)
+        expected = os.path.expanduser("~/.ax/claude_prime-listener-heartbeat")
+        self.assertEqual(env["AX_HEARTBEAT_FILE"], expected)
+
+    def test_heartbeat_file_config_override_respected(self):
+        cfg = {"fleet": {"device": "laptop", "sponsor": "@madtank"},
+               "agents": {"claude_prime": {"token_file": "/abs/tok.json",
+                                           "heartbeat_file": "/abs/hb.json"}}}
+        env = fd.child_env("claude_prime", cfg)
+        self.assertEqual(env["AX_HEARTBEAT_FILE"], "/abs/hb.json")

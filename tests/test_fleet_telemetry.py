@@ -1,8 +1,72 @@
-import json, unittest
+import json, os, tempfile, unittest
 from pathlib import Path
 import fleet_daemon as fd
 
 GOLDEN = Path(__file__).parent / "fixtures" / "telemetry_golden.json"
+
+
+class _StubProc:
+    """Scripted AgentProc stand-in (no real processes)."""
+
+    def __init__(self, name, log_path):
+        self.name, self.log_path = name, log_path
+        self.pid = 4411
+        self.failure_times = []
+
+    def alive(self):
+        return True
+
+    def signal_wake(self):
+        pass
+
+    def spawn(self):
+        pass
+
+
+class RuntimeShapeTest(unittest.TestCase):
+    """The golden fixture is the shared backend contract — the body that
+    the REAL daemon_tick snapshot path sends must have the same shape."""
+
+    def test_daemon_tick_body_matches_golden_shape(self):
+        golden = json.loads(GOLDEN.read_text())
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "a.log")
+        with open(log, "w") as f:
+            f.write("4990 NOTIFY @a mention\n")          # fresh receipt -> OK
+        tok = os.path.join(d, "tok.json")
+        with open(tok, "w") as f:
+            json.dump({"expires_at": 5630}, f)
+        hb = os.path.join(d, "hb.json")
+        with open(hb, "w") as f:
+            json.dump({"connected": True, "currently_401": False,
+                       "mentions_seen": 142, "replies_sent": 131}, f)
+        cfg = {"fleet": {"device": "laptop"},
+               "agents": {"a": {"token_file": tok, "heartbeat_file": hb}}}
+        agents = {"a": _StubProc("a", log)}
+        ctx = fd.new_ctx(cfg, agents, token=None,
+                         state_file=os.path.join(d, "state.json"),
+                         mono_now=1000.0, wall_now=5000.0)
+        fd.daemon_tick(ctx, mono_now=1015.0, wall_now=5015.0)
+        body = fd.daemon_tick(ctx, mono_now=1030.0, wall_now=5030.0)
+        # Same top-level, device_state, host, and per-agent keys as golden.
+        self.assertEqual(set(body), set(golden))
+        self.assertEqual(set(body["device_state"]), set(golden["device_state"]))
+        self.assertEqual(set(body["device_state"]["host"]),
+                         set(golden["device_state"]["host"]))
+        self.assertEqual(set(body["agents"]["a"]),
+                         set(golden["agents"]["claude_prime"]))
+        # And the listener-owned fields really come from the heartbeat file.
+        snap = body["agents"]["a"]
+        self.assertEqual(snap["verdict"], "OK")
+        self.assertIs(snap["sse_connected"], True)
+        self.assertEqual(snap["mentions_seen"], 142)
+        self.assertEqual(snap["replies_sent"], 131)
+        self.assertIs(snap["currently_401"], False)
+
+    def test_heartbeat_fields_default_to_none_when_file_missing(self):
+        hb = fd.read_heartbeat("/nonexistent/heartbeat.json")
+        self.assertEqual(hb, {"sse_connected": None, "mentions_seen": None,
+                              "replies_sent": None, "currently_401": None})
 
 class TelemetryBuildTest(unittest.TestCase):
     def test_matches_golden_contract(self):
