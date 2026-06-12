@@ -496,12 +496,14 @@ def main():
             print(f"[fleet] spawned @{name} pid {ag.pid}", flush=True)
         agents[name] = ag
 
-    def _sigterm(signum, frame):
-        print("[fleet] SIGTERM — terminating children, exiting", flush=True)
+    def _shutdown(signum, frame):
+        print(f"[fleet] {signal.Signals(signum).name} — terminating children, "
+              "exiting", flush=True)
         for ag in agents.values():
             ag.terminate()
         sys.exit(0)
-    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)   # Ctrl-C: same clean shutdown
 
     ctx = new_ctx(cfg, agents, token=_load_device_token())
     while True:

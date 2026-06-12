@@ -165,3 +165,44 @@ class MainWiringTest(unittest.TestCase):
                 fd.main()
         self.assertEqual(spawned, ["a"])                      # b never spawned
         self.assertEqual(set(captured["agents"]), {"a", "b"})  # b still in telemetry
+
+    def test_sigint_mirrors_sigterm_terminates_children_and_exits(self):
+        import signal as _signal
+        home = tempfile.mkdtemp()
+        procs = {}
+
+        class FakeProc:
+            def __init__(self, name, argv, env, log_path):
+                self.name, self.log_path, self.pid = name, log_path, 4242
+                self.terminates = 0
+                procs[name] = self
+
+            def spawn(self):
+                pass
+
+            def terminate(self):
+                self.terminates += 1
+
+        handlers = {}
+        cfg = make_cfg(["a"])
+        with mock.patch.dict(os.environ, {"HOME": home}), \
+             mock.patch.object(fd, "AgentProc", FakeProc), \
+             mock.patch.object(fd, "load_fleet_config", lambda path: cfg), \
+             mock.patch.object(fd, "_acquire_singleton_lock", lambda: None), \
+             mock.patch.object(fd, "_load_device_token", lambda: None), \
+             mock.patch.object(fd.signal, "signal",
+                               side_effect=lambda s, h:
+                                   handlers.__setitem__(s, h)), \
+             mock.patch.object(fd.time, "sleep",
+                               side_effect=KeyboardInterrupt), \
+             mock.patch.object(fd.sys, "argv", ["fleet_daemon.py"]):
+            with self.assertRaises(KeyboardInterrupt):
+                fd.main()
+        # Both signals registered, same clean-shutdown handler (Ctrl-C on a
+        # foreground daemon must not orphan children).
+        self.assertIn(_signal.SIGTERM, handlers)
+        self.assertIn(_signal.SIGINT, handlers)
+        self.assertIs(handlers[_signal.SIGINT], handlers[_signal.SIGTERM])
+        with self.assertRaises(SystemExit):
+            handlers[_signal.SIGINT](_signal.SIGINT, None)
+        self.assertEqual(procs["a"].terminates, 1)
