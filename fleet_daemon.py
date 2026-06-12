@@ -24,6 +24,8 @@ SUSPEND_DRIFT_S = 30
 TOKEN_WEDGE_S = -600          # expired this long with child alive = wedged
 DEAF_THRESHOLD_S = 1800       # uniform start; tune from soak data (spec §11.4)
 
+TELEMETRY_EVENT_CAP = 50
+
 # Per-agent identity/state vars the listener binds from its environment
 # (ax_presence_listener.py). Any of these inherited from the daemon's own
 # env would bind every child to one agent's identity or files (same bug
@@ -163,3 +165,20 @@ def verdict(s):
     if s["receipt_age_s"] > DEAF_THRESHOLD_S:
         return "DEAF"
     return "OK"
+
+
+def build_telemetry(fleet, fleet_id, daemon_version, seq, sent_at,
+                    device_state, agent_snaps, events):
+    """Assemble the §7 telemetry body (frozen contract — golden fixture
+    tests/fixtures/telemetry_golden.json is shared with nyx's backend).
+    commands_ack is reserved in the schema, not built in MVP."""
+    return {
+        "device": fleet.get("device", "unknown"),
+        "daemon_version": daemon_version,
+        "fleet_id": fleet_id,
+        "seq": seq, "sent_at": sent_at,
+        "device_state": device_state,
+        "agents": agent_snaps,
+        "events": list(events)[-TELEMETRY_EVENT_CAP:],
+        "commands_ack": [],
+    }
