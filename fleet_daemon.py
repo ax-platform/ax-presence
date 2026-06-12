@@ -52,3 +52,17 @@ def load_fleet_config(path):
             a.setdefault(k, v)
         a["token_file"] = os.path.expanduser(a["token_file"])
     return {"fleet": data.get("fleet", {}), "agents": agents}
+
+
+def child_env(name, cfg):
+    """Build the child listener's environment. NEVER sets AX_SPACE_ID —
+    the child derives its space from its agent record (bug 80588cba)."""
+    env = dict(os.environ)
+    env.pop("AX_SPACE_ID", None)
+    a = cfg["agents"][name]
+    env.update({
+        "AX_AGENT_HANDLE": name,
+        "AX_TOKEN_FILE": a["token_file"],
+        "AX_SPONSOR": cfg["fleet"].get("sponsor", "@your-sponsor"),
+    })
+    return env
