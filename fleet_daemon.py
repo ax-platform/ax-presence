@@ -21,6 +21,9 @@ CRASHLOOP_WINDOW_S = 600
 
 SUSPEND_DRIFT_S = 30
 
+TOKEN_WEDGE_S = -600          # expired this long with child alive = wedged
+DEAF_THRESHOLD_S = 1800       # uniform start; tune from soak data (spec §11.4)
+
 # Per-agent identity/state vars the listener binds from its environment
 # (ax_presence_listener.py). Any of these inherited from the daemon's own
 # env would bind every child to one agent's identity or files (same bug
@@ -144,3 +147,19 @@ def last_receipt_age(log_path, now, _tail_bytes=262_144):
         if len(parts) == 2 and parts[1].startswith("NOTIFY ") and parts[0].isdigit():
             newest = int(parts[0])
     return None if newest is None else int(now - newest)
+
+
+def verdict(s):
+    if s["disabled"]:
+        return "DISABLED"
+    if s["crashloop"]:
+        return "CRASHLOOP"
+    if not s["alive"]:
+        return "DOWN"
+    if s["token_ttl_s"] is not None and s["token_ttl_s"] < TOKEN_WEDGE_S:
+        return "TOKEN"
+    if s["receipt_age_s"] is None:
+        return "QUIET"
+    if s["receipt_age_s"] > DEAF_THRESHOLD_S:
+        return "DEAF"
+    return "OK"
