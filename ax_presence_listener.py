@@ -356,13 +356,29 @@ def keeper(mid, stop):
     _pending.pop(mid, None)
 
 
-_wake_requested = False
+# One wake, two independent consumers — separate flags so neither can starve
+# the other (a single shared flag let the presence beat consume the wake before
+# stream() ever saw it, and vice versa).
+_wake_requested = False    # consumed by _presence_beat(): force a token refresh
+_wake_reconnect = False    # consumed by stream(): classify the forced reconnect
+_sse_response = None       # live SSE response, stashed by stream() for the wake close
 
 
 def _handle_wake_signal(signum, frame):
-    """SIGUSR1 from the fleet daemon: host woke from suspend. Only set a
-    flag here (signal-handler safety); loops consume it."""
+    """SIGUSR1 from the fleet daemon: host woke from suspend. Set one flag per
+    consumer, then close the live SSE response: a flag alone can never break a
+    read blocked on a half-open post-suspend socket (PEP 475 just retries the
+    read after this handler returns), so the close IS the reconnect mechanism.
+    Safe here: the handler runs as ordinary bytecode on the main thread — the
+    same thread that owns the read — and close() is idempotent."""
     globals()["_wake_requested"] = True
+    globals()["_wake_reconnect"] = True
+    r = _sse_response
+    if r is not None:
+        try:
+            r.close()
+        except Exception:
+            pass
 
 
 def _consume_wake_request():
@@ -372,12 +388,23 @@ def _consume_wake_request():
     return False
 
 
+def _consume_wake_reconnect():
+    if _wake_reconnect:
+        globals()["_wake_reconnect"] = False
+        return True
+    return False
+
+
 def _presence_beat():
     """One platform heartbeat POST. On a fleet wake (SIGUSR1) force a token
     refresh first — the child owns its refresh path; the daemon never touches
-    token files — so the first post-suspend beat carries a verified token."""
-    if _consume_wake_request():
-        at = refresh()["access_token"]
+    token files — so the first post-suspend beat carries a verified token.
+    The wake is consumed only AFTER the refresh succeeds: if refresh() raises
+    (transient post-wake network), the flag stays set and the next beat retries
+    the forced refresh instead of falling back to load_tok()."""
+    if _wake_requested:
+        at = refresh()["access_token"]   # raises -> flag stays set for retry
+        _consume_wake_request()
     else:
         at = load_tok().get("access_token")
     req = urllib.request.Request(HEARTBEAT_URL, data=b"{}",
@@ -387,12 +414,12 @@ def _presence_beat():
 
 
 def presence_loop():
-    derive_space_id_from_agent_record()
     """Publish liveness to the PLATFORM: POST /api/v1/agents/heartbeat every ~20s
     (server TTL ~30s) so this agent shows 'online' + responsive in the agents
     presence/availability views. The endpoints already exist server-side; the
     common gap is that agents simply never call them, so everyone reads 'offline'.
     Calling this is what makes an agent discoverable as alive."""
+    derive_space_id_from_agent_record()
     while True:
         try:
             _presence_beat()
@@ -667,67 +694,79 @@ def stream():
         "Accept": "text/event-stream",
     })
     r = urllib.request.urlopen(req, timeout=None)
+    # Stash for the SIGUSR1 wake handler, which closes this to break a read
+    # blocked on a half-open post-suspend socket (the only way out: the read
+    # has no timeout and PEP 475 retries it straight through a mere flag).
+    globals()["_sse_response"] = r
+    # A wake that fired while we were disconnected is already satisfied by
+    # this fresh connection — drop the stale request so a later genuine read
+    # error is not misclassified as a wake reconnect.
+    _consume_wake_reconnect()
     globals()["_connected"] = True
     globals()["_currently_401"] = False
     print(f"[status] SSE connected, watching for @{AGENT_HANDLE} mentions", flush=True)
     event = None
-    for raw in r:
-        if _wake_requested:
-            # Fleet wake (SIGUSR1): break to the reconnect path so the SSE
-            # connection is re-established post-suspend; the presence beat
-            # consumes the flag and re-verifies the token.
+    try:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                # WAKE is mention-only; 'message' is used ONLY to detect this agent's
+                # own reply landing, which stops that message's busy-keeper.
+                if event in ("message", "mention"):
+                    try:
+                        d = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    # Rolling cross-space feed: record on the 'message' firehose (the
+                    # superset; 'mention' is a subset) so each message lands once,
+                    # including this agent's own posts (full activity view).
+                    if event == "message":
+                        record_home_event(d, event)
+                    if d.get("agent_id") == AGENT_ID:
+                        par = d.get("parent_id")
+                        if par in _pending:
+                            _pending[par].set()  # our reply landed -> stop the keeper
+                        continue  # never wake on our own posts
+                    mid = d.get("id")
+                    if event == "mention" and mentions_me(d) and mid not in _seen_ids:
+                        _seen_ids.add(mid)
+                        if len(_seen_ids) > 5000:
+                            _seen_ids.clear()
+                        globals()["_mentions_seen"] += 1
+                        who = d.get("username") or d.get("display_name") or "someone"
+                        # FULL message (no truncation); newlines flattened to one event.
+                        content = (d.get("content") or "").replace("\n", " ").replace("\r", " ")
+                        atts = d.get("attachments") or (d.get("metadata") or {}).get("attachments") or []
+                        att = f" [+{len(atts)} attachment(s)]" if atts else ""
+                        # Cross-space awareness: the SSE stream is token-scoped (delivers ALL
+                        # the agent's spaces), so tag which space the mention came from.
+                        sp = d.get("space_id") or "?"
+                        # One stdout write (the wake) — content newlines are already flattened, so
+                        # the only newline is the respond-hint: tells you exactly how to reply.
+                        _self = os.path.basename(__file__)
+                        print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}"
+                              f"\n  ↩ respond: python3 {_self} --reply {mid} \"your reply\"   ·   update: --say \"…\"",
+                              flush=True)
+                        # Intent-aware: in the background (never delays the wake), surface
+                        # the sender's recent thread so the agent reads their throughline.
+                        threading.Thread(target=emit_sender_context, args=(d,), daemon=True).start()
+                        post_processing_status(mid, "thinking", f"got your message — @{AGENT_HANDLE} is on it")
+                        stop = threading.Event()
+                        _pending[mid] = stop
+                        threading.Thread(target=keeper, args=(mid, stop), daemon=True).start()
+            elif line == "":
+                event = None
+    except Exception:
+        if _consume_wake_reconnect():
+            # Fleet wake (SIGUSR1) closed the socket out from under the read —
+            # an intentional reconnect, not a failure. Return normally so
+            # main() resets its backoff and the circuit breaker never counts
+            # it. The presence beat re-verifies the token on its own flag.
             print("[status] wake signal — forcing SSE reconnect", flush=True)
-            break
-        line = raw.decode("utf-8", "replace").rstrip("\n")
-        if line.startswith("event:"):
-            event = line[6:].strip()
-        elif line.startswith("data:"):
-            # WAKE is mention-only; 'message' is used ONLY to detect this agent's
-            # own reply landing, which stops that message's busy-keeper.
-            if event in ("message", "mention"):
-                try:
-                    d = json.loads(line[5:].strip())
-                except Exception:
-                    continue
-                # Rolling cross-space feed: record on the 'message' firehose (the
-                # superset; 'mention' is a subset) so each message lands once,
-                # including this agent's own posts (full activity view).
-                if event == "message":
-                    record_home_event(d, event)
-                if d.get("agent_id") == AGENT_ID:
-                    par = d.get("parent_id")
-                    if par in _pending:
-                        _pending[par].set()  # our reply landed -> stop the keeper
-                    continue  # never wake on our own posts
-                mid = d.get("id")
-                if event == "mention" and mentions_me(d) and mid not in _seen_ids:
-                    _seen_ids.add(mid)
-                    if len(_seen_ids) > 5000:
-                        _seen_ids.clear()
-                    globals()["_mentions_seen"] += 1
-                    who = d.get("username") or d.get("display_name") or "someone"
-                    # FULL message (no truncation); newlines flattened to one event.
-                    content = (d.get("content") or "").replace("\n", " ").replace("\r", " ")
-                    atts = d.get("attachments") or (d.get("metadata") or {}).get("attachments") or []
-                    att = f" [+{len(atts)} attachment(s)]" if atts else ""
-                    # Cross-space awareness: the SSE stream is token-scoped (delivers ALL
-                    # the agent's spaces), so tag which space the mention came from.
-                    sp = d.get("space_id") or "?"
-                    # One stdout write (the wake) — content newlines are already flattened, so
-                    # the only newline is the respond-hint: tells you exactly how to reply.
-                    _self = os.path.basename(__file__)
-                    print(f"NOTIFY @{AGENT_HANDLE} mention [space {sp}] from {who} (msg {mid}){att}: {content}"
-                          f"\n  ↩ respond: python3 {_self} --reply {mid} \"your reply\"   ·   update: --say \"…\"",
-                          flush=True)
-                    # Intent-aware: in the background (never delays the wake), surface
-                    # the sender's recent thread so the agent reads their throughline.
-                    threading.Thread(target=emit_sender_context, args=(d,), daemon=True).start()
-                    post_processing_status(mid, "thinking", f"got your message — @{AGENT_HANDLE} is on it")
-                    stop = threading.Event()
-                    _pending[mid] = stop
-                    threading.Thread(target=keeper, args=(mid, stop), daemon=True).start()
-        elif line == "":
-            event = None
+            return
+        raise
 
 
 def status_loop():
