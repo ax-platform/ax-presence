@@ -15,6 +15,18 @@ except ImportError:           # Python < 3.11 (older Ubuntu boxes)
 
 AGENT_DEFAULTS = {"platform": "ax", "catchup": "ask"}
 
+# Per-agent identity/state vars the listener binds from its environment
+# (ax_presence_listener.py). Any of these inherited from the daemon's own
+# env would bind every child to one agent's identity or files (same bug
+# class as 80588cba), so child_env scrubs them all before injecting the
+# per-agent whitelist. Fleet-wide vars (AX_BASE, AX_INTERNAL_SIGNAL_KEY)
+# are intentionally NOT listed — children inherit those.
+PER_AGENT_ENV_VARS = (
+    "AX_SPACE_ID", "AX_AGENT_ID", "AX_AGENT_HANDLE", "AX_TOKEN_FILE",
+    "AX_HEARTBEAT_FILE", "AX_ACTIVITY_FILE", "AX_ACTIVITY_JSON_FILE",
+    "AX_REMINDERS_FILE", "AX_HOME_FEED_FILE", "AX_BUSY_MESSAGES_FILE",
+)
+
 
 def _parse_toml_minimal(text):
     """Fallback parser for the flat [section] / key = "value" subset
@@ -56,9 +68,12 @@ def load_fleet_config(path):
 
 def child_env(name, cfg):
     """Build the child listener's environment. NEVER sets AX_SPACE_ID —
-    the child derives its space from its agent record (bug 80588cba)."""
+    the child derives its space from its agent record (bug 80588cba) —
+    and strips every inherited per-agent AX_* var so children never share
+    an identity, heartbeat, or activity file with the daemon or each other."""
     env = dict(os.environ)
-    env.pop("AX_SPACE_ID", None)
+    for var in PER_AGENT_ENV_VARS:
+        env.pop(var, None)
     a = cfg["agents"][name]
     env.update({
         "AX_AGENT_HANDLE": name,
