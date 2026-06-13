@@ -225,7 +225,14 @@ def verdict(s):
     if s["receipt_age_s"] is None:
         return "QUIET"
     if s["receipt_age_s"] > DEAF_THRESHOLD_S:
-        return "DEAF"
+        # A connected listener with a stale mention feed is QUIET, not deaf:
+        # an idle overnight channel legitimately sends nothing for hours, so a
+        # pure receipt-age threshold false-positives at ANY value (soak cycle 1
+        # bounced three times, the last at the raised 5400s line). Only an
+        # actually-dropped SSE socket (sse_connected false/None) is DEAF. The
+        # half-open case — connected flag true but socket dead — needs the
+        # stream-activity clock from the monitor-hardening detector (9d1c13cb).
+        return "DEAF" if not s["sse_connected"] else "QUIET"
     return "OK"
 
 
@@ -403,10 +410,19 @@ def daemon_tick(ctx, mono_now, wall_now):
     snaps = {}
     for name, ag in agents.items():
         a = cfg["agents"][name]
+        # Rich fields live in the SIGNAL file (the real listener's heartbeat
+        # file is just a bare-int liveness epoch); legacy dict-format
+        # heartbeat files still fill any field the signal file doesn't.
+        # Read it BEFORE the verdict: sse_connected gates DEAF (a connected
+        # listener with a quiet feed is QUIET, not deaf).
+        sig = read_heartbeat(signal_path(name, a))
+        legacy = read_heartbeat(heartbeat_path(name, a))
+        hb = {k: legacy[k] if sig[k] is None else sig[k] for k in sig}
         s = {"alive": ag.alive(), "disabled": bool(a.get("disabled")),
              "crashloop": is_crashloop(ag.failure_times, wall_now),
              "token_ttl_s": token_ttl(a["token_file"], wall_now),
-             "receipt_age_s": last_receipt_age(ag.log_path, wall_now)}
+             "receipt_age_s": last_receipt_age(ag.log_path, wall_now),
+             "sse_connected": hb["sse_connected"]}
         v = verdict(s)
         if in_grace and v in ("DEAF", "TOKEN"):
             # Stale receipts AND long-expired tokens are expected right after
@@ -436,12 +452,6 @@ def daemon_tick(ctx, mono_now, wall_now):
                           f"times in {CRASHLOOP_WINDOW_S}s — respawns held, "
                           "manual attention needed")
 
-        # Rich fields live in the SIGNAL file (the real listener's heartbeat
-        # file is just a bare-int liveness epoch); legacy dict-format
-        # heartbeat files still fill any field the signal file doesn't.
-        sig = read_heartbeat(signal_path(name, a))
-        legacy = read_heartbeat(heartbeat_path(name, a))
-        hb = {k: legacy[k] if sig[k] is None else sig[k] for k in sig}
         snaps[name] = {"verdict": v,
                        "pid": ag.pid if s["alive"] else None,
                        "sse_connected": hb["sse_connected"],
