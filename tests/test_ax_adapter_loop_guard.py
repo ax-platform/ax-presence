@@ -85,7 +85,11 @@ def load_adapter_module():
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    # Prove import portability independent of the developer machine's
+    # AX_PRESENCE_DIR.  Individual tests cover explicit env override behavior.
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("AX_PRESENCE_DIR", None)
+        spec.loader.exec_module(module)
     return module
 
 
@@ -154,6 +158,7 @@ class AXAdapterLoopGuardTest(unittest.TestCase):
     def test_ax_presence_dir_is_inferred_without_machine_specific_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(Path(self.module._find_ax_presence_dir()).resolve(), ROOT)
+        self.assertEqual(Path(self.module._AX_DIR).resolve(), ROOT)
         self.assertNotIn("/home/ax-agents/ax-presence", ADAPTER_PATH.read_text())
 
     def test_ax_presence_dir_env_override_is_respected(self):
