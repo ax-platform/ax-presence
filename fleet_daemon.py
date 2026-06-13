@@ -23,7 +23,10 @@ CRASHLOOP_WINDOW_S = 600
 SUSPEND_DRIFT_S = 30
 
 TOKEN_WEDGE_S = -600          # expired this long with child alive = wedged
-DEAF_THRESHOLD_S = 1800       # uniform start; tune from soak data (spec §11.4)
+DEAF_THRESHOLD_S = 5400       # tuned from soak cycle 1 (spec §11.4): 1800s bounced
+                              # healthy children twice on normal 30-60min evening
+                              # mention gaps; quiet-vs-deaf can't be distinguished
+                              # locally until phase-2 server-side traffic cross-check
 
 TELEMETRY_EVENT_CAP = 50
 
