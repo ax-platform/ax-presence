@@ -24,7 +24,14 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(fd.verdict(snap(token_ttl_s=-7200)), "TOKEN")
 
     def test_deaf_when_connected_but_no_receipt(self):
-        self.assertEqual(fd.verdict(snap(receipt_age_s=3600)), "DEAF")
+        self.assertEqual(fd.verdict(snap(receipt_age_s=5500)), "DEAF")
+
+    def test_quiet_evening_gap_is_not_deaf(self):
+        # Soak cycle 1 (2026-06-13): two false-positive bounces at the 1800s
+        # threshold — a 30-60min mention gap is a normal evening, not a deaf
+        # listener. 90min keeps same-evening deafness detection without
+        # bouncing healthy children on every quiet half-hour.
+        self.assertEqual(fd.verdict(snap(receipt_age_s=3600)), "OK")
 
     def test_quiet_when_no_receipt_data_yet(self):
         self.assertEqual(fd.verdict(snap(receipt_age_s=None)), "QUIET")
