@@ -23,8 +23,17 @@ class VerdictTest(unittest.TestCase):
     def test_token_wedge(self):
         self.assertEqual(fd.verdict(snap(token_ttl_s=-7200)), "TOKEN")
 
-    def test_deaf_when_connected_but_no_receipt(self):
-        self.assertEqual(fd.verdict(snap(receipt_age_s=3600)), "DEAF")
+    def test_quiet_when_connected_but_no_recent_receipt(self):
+        self.assertEqual(fd.verdict(snap(receipt_age_s=3600)), "QUIET")
+
+    def test_deaf_when_listener_disconnected_and_no_recent_receipt(self):
+        self.assertEqual(fd.verdict(snap(receipt_age_s=3600, sse_connected=False)), "DEAF")
+
+    def test_space_drift_has_its_own_verdict(self):
+        self.assertEqual(fd.verdict(snap(space_state="drift")), "SPACE")
+
+    def test_current_401_is_token_drift_even_before_expiry(self):
+        self.assertEqual(fd.verdict(snap(currently_401=True)), "TOKEN")
 
     def test_quiet_when_no_receipt_data_yet(self):
         self.assertEqual(fd.verdict(snap(receipt_age_s=None)), "QUIET")

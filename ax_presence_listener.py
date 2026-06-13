@@ -78,6 +78,7 @@ _seen_ids = set()       # dedup: same msg arrives as both 'message' and 'mention
 _alerted_exit = False   # exit alert fires at most once
 _connected = False
 _mentions_seen = 0
+_last_mention_at = 0
 _replies_sent = 0          # productivity signal: replies/posts this listener has landed
 _last_reply_at = 0         # epoch of the last successful reply/post (0 = none yet)
 _currently_401 = False     # token currently rejected (mute/broken) — distinct from dormant
@@ -471,6 +472,7 @@ def heartbeat_loop():
             # Lets the ladder route 'present-but-mute/401-broken' to FIX, not archive.
             sig = {"handle": AGENT_HANDLE, "ts": int(time.time()), "connected": _connected,
                    "currently_401": _currently_401, "mentions_seen": _mentions_seen,
+                   "last_mention_at": _last_mention_at, "space_id": SPACE_ID,
                    "replies_sent": _replies_sent, "last_reply_at": _last_reply_at,
                    "responsiveness_ratio": (round(_replies_sent / _mentions_seen, 3)
                                             if _mentions_seen else None)}
@@ -488,7 +490,8 @@ def heartbeat_loop():
             try:
                 sbody = json.dumps({"agent_id": AGENT_ID, "currently_401": _currently_401,
                     "responsiveness_ratio": (round(_replies_sent / _mentions_seen, 3) if _mentions_seen else None),
-                    "mentions_seen": _mentions_seen, "replies_sent": _replies_sent,
+                    "mentions_seen": _mentions_seen, "last_mention_at": _last_mention_at,
+                    "space_id": SPACE_ID, "replies_sent": _replies_sent,
                     "last_reply_at": _last_reply_at}).encode()
                 urllib.request.urlopen(urllib.request.Request(SIGNAL_URL, data=sbody, method="POST",
                     headers={"X-API-Key": SIGNAL_API_KEY, "Content-Type": "application/json"}), timeout=10)
@@ -776,6 +779,7 @@ def stream():
                         if len(_seen_ids) > 5000:
                             _seen_ids.clear()
                         globals()["_mentions_seen"] += 1
+                        globals()["_last_mention_at"] = int(time.time())
                         who = d.get("username") or d.get("display_name") or "someone"
                         # FULL message (no truncation); newlines flattened to one event.
                         content = (d.get("content") or "").replace("\n", " ").replace("\r", " ")

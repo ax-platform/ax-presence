@@ -47,10 +47,15 @@ class WatchdogActionsTest(unittest.TestCase):
         with open(self.tok, "w") as f:
             json.dump({"expires_at": expires_at}, f)
 
+    def _write_signal(self, *, connected=True, currently_401=False):
+        with open(os.path.join(self.dir, "a-signal.json"), "w") as f:
+            json.dump({"connected": connected, "currently_401": currently_401}, f)
+
     def _ctx(self, token_file=None, fleet_extra=None):
         cfg = {"fleet": {"device": "testbox", **(fleet_extra or {})},
                "agents": {"a": {"token_file":
-                                token_file or "/nonexistent-token.json"}}}
+                                token_file or "/nonexistent-token.json",
+                                "signal_file": os.path.join(self.dir, "a-signal.json")}}}
         self.agents = {"a": StubProc("a", self.log)}
         return fd.new_ctx(cfg, self.agents, token=None,
                           state_file=self.state_file,
@@ -58,6 +63,7 @@ class WatchdogActionsTest(unittest.TestCase):
 
     def test_deaf_bounces_once_per_episode_with_audit_and_event(self):
         self._write_log(["1000 NOTIFY @a mention"])   # 4000s stale => DEAF
+        self._write_signal(connected=False)
         ctx = self._ctx()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

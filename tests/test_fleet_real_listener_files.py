@@ -3,7 +3,8 @@
 ax_presence_listener.py heartbeat_loop writes TWO files:
   - AX_HEARTBEAT_FILE gets a BARE INT epoch:  f.write(str(int(time.time())))
   - ~/.ax/{AGENT_HANDLE}-signal.json gets the rich dict (handle/ts/connected/
-    currently_401/mentions_seen/replies_sent/last_reply_at/responsiveness_ratio)
+    currently_401/mentions_seen/last_mention_at/space_id/replies_sent/
+    last_reply_at/responsiveness_ratio)
 
 The original read_heartbeat() expected a JSON dict in the heartbeat file, so
 json.load("1765500000") -> int and .get() raised AttributeError, killing the
@@ -13,7 +14,8 @@ import json, os, tempfile, time, unittest
 import fleet_daemon as fd
 
 NONE_FIELDS = {"sse_connected": None, "mentions_seen": None,
-               "replies_sent": None, "currently_401": None}
+               "replies_sent": None, "currently_401": None,
+               "last_mention_at": None, "space_id": None}
 
 
 def write_real_heartbeat(path, epoch=None):
@@ -27,6 +29,7 @@ def write_real_signal(path, **overrides):
     """EXACTLY the dict the listener writes (ax_presence_listener.py:458-466)."""
     sig = {"handle": "a", "ts": int(time.time()), "connected": True,
            "currently_401": False, "mentions_seen": 142,
+           "last_mention_at": int(time.time()), "space_id": "space-a",
            "replies_sent": 131, "last_reply_at": int(time.time()),
            "responsiveness_ratio": round(131 / 142, 3)}
     sig.update(overrides)
@@ -53,7 +56,8 @@ class ReadHeartbeatRealFormatTest(unittest.TestCase):
                        "replies_sent": 5, "currently_401": False}, f)
         self.assertEqual(fd.read_heartbeat(self.path),
                          {"sse_connected": True, "mentions_seen": 7,
-                          "replies_sent": 5, "currently_401": False})
+                          "replies_sent": 5, "currently_401": False,
+                          "last_mention_at": None, "space_id": None})
 
     def test_garbage_and_non_dict_json_never_raise(self):
         for content in ("not json {{{", "null", '"a string"', "[1, 2]", ""):
