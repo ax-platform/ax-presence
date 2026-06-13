@@ -57,31 +57,31 @@ class WatchdogActionsTest(unittest.TestCase):
                           mono_now=1000.0, wall_now=5000.0)
 
     def test_deaf_bounces_once_per_episode_with_audit_and_event(self):
-        self._write_log(["1000 NOTIFY @a mention"])   # 4000s stale => DEAF
+        self._write_log(["1000 NOTIFY @a mention"])   # 5500s stale => DEAF
         ctx = self._ctx()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            fd.daemon_tick(ctx, mono_now=1015.0, wall_now=5015.0)
+            fd.daemon_tick(ctx, mono_now=2500.0, wall_now=6500.0)
         ag = self.agents["a"]
         self.assertEqual(ag.terminates, 1)            # bounced
         self.assertIn("bounce @a", out.getvalue())    # audit line
         # Telemetry beat carries the bounce event exactly once.
-        body = fd.daemon_tick(ctx, mono_now=1030.0, wall_now=5030.0)
+        body = fd.daemon_tick(ctx, mono_now=2515.0, wall_now=6515.0)
         self.assertEqual([e for e in body["events"] if e["kind"] == "bounce"],
                          [{"kind": "bounce", "agent": "a", "reason": "DEAF"}])
         # Respawn lands, receipt is STILL stale (same DEAF episode):
         # no second bounce per tick.
-        fd.daemon_tick(ctx, mono_now=1045.0, wall_now=5045.0)  # respawns
+        fd.daemon_tick(ctx, mono_now=2530.0, wall_now=6530.0)  # respawns
         self.assertEqual(ag.spawns, 1)
-        fd.daemon_tick(ctx, mono_now=1060.0, wall_now=5060.0)
+        fd.daemon_tick(ctx, mono_now=2545.0, wall_now=6545.0)
         self.assertEqual(ag.terminates, 1)
         # Fresh receipt ends the episode...
-        self._write_log(["5070 NOTIFY @a mention"], mode="a")
-        fd.daemon_tick(ctx, mono_now=1075.0, wall_now=5075.0)
+        self._write_log(["6555 NOTIFY @a mention"], mode="a")
+        fd.daemon_tick(ctx, mono_now=2560.0, wall_now=6560.0)
         self.assertEqual(ag.terminates, 1)
         # ...so a NEW deaf episode bounces again (mono/wall advance in step:
         # no suspend, no grace window).
-        fd.daemon_tick(ctx, mono_now=5075.0, wall_now=9075.0)
+        fd.daemon_tick(ctx, mono_now=8060.0, wall_now=12060.0)
         self.assertEqual(ag.terminates, 2)
 
     def test_token_wedge_bounces_once_per_episode(self):
