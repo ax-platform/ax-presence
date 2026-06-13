@@ -44,3 +44,6 @@ class VerdictTest(unittest.TestCase):
 
     def test_quiet_when_no_receipt_data_yet(self):
         self.assertEqual(fd.verdict(snap(receipt_age_s=None)), "QUIET")
+
+    def test_deaf_when_no_receipt_data_and_listener_disconnected(self):
+        self.assertEqual(fd.verdict(snap(receipt_age_s=None, sse_connected=False)), "DEAF")

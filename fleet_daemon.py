@@ -249,7 +249,7 @@ def verdict(s):
     if s.get("currently_401") or token_state(s.get("token_ttl_s")) == "wedged":
         return "TOKEN"
     if s["receipt_age_s"] is None:
-        return "QUIET"
+        return "DEAF" if s.get("sse_connected") is False else "QUIET"
     if s["receipt_age_s"] > DEAF_THRESHOLD_S:
         # Receipt staleness alone is not proof of deafness: an agent may simply
         # have had no expected traffic. Only call it DEAF when the listener's
