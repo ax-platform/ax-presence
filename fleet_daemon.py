@@ -253,8 +253,10 @@ def verdict(s):
     if s["receipt_age_s"] > DEAF_THRESHOLD_S:
         # Receipt staleness alone is not proof of deafness: an agent may simply
         # have had no expected traffic. Only call it DEAF when the listener's
-        # own signal says SSE is disconnected; otherwise classify as QUIET so
-        # the monitor does not bounce/page quiet agents as broken.
+        # own signal explicitly says SSE is disconnected; otherwise classify as
+        # QUIET so the monitor does not bounce/page quiet agents as broken.
+        # The half-open case (connected flag true but socket dead) needs a
+        # separate stream-activity clock, not a receipt-age inference.
         return "DEAF" if s.get("sse_connected") is False else "QUIET"
     return "OK"
 
@@ -435,6 +437,12 @@ def daemon_tick(ctx, mono_now, wall_now):
     snaps = {}
     for name, ag in agents.items():
         a = cfg["agents"][name]
+        # Rich fields live in the SIGNAL file (the real listener's heartbeat
+        # file is just a bare-int liveness epoch); legacy dict-format
+        # heartbeat files still fill any field the signal file doesn't.
+        # Read it BEFORE the verdict: sse_connected gates DEAF (a connected
+        # listener with a quiet feed is QUIET, not deaf), while token and space
+        # drift remain separate verdict dimensions.
         sig = read_heartbeat(signal_path(name, a))
         legacy = read_heartbeat(heartbeat_path(name, a))
         hb = {k: legacy[k] if sig[k] is None else sig[k] for k in sig}
