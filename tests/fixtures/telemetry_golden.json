@@ -12,7 +12,10 @@
     "claude_prime": {
       "verdict": "OK", "pid": 4411, "sse_connected": true,
       "last_receipt_age_s": 38, "token_ttl_s": 660,
-      "mentions_seen": 142, "replies_sent": 131, "currently_401": false
+      "token_state": "valid", "mentions_seen": 142,
+      "last_mention_at": 4990, "replies_sent": 131,
+      "currently_401": false, "listener_space_id": "space-a",
+      "expected_space_id": "space-a", "space_state": "ok"
     }
   },
   "events": [

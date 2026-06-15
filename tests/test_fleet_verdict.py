@@ -28,26 +28,34 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(
             fd.verdict(snap(receipt_age_s=5500, sse_connected=False)), "DEAF")
 
-    def test_deaf_when_no_connection_evidence_and_stale(self):
-        # No signal file yet (sse_connected=None) + stale receipts: we can't
-        # prove the listener is connected, so treat as DEAF. (This is the
-        # watchdog-episode path: a child with no signal file bounces.)
+    def test_unknown_connection_with_stale_feed_is_quiet_not_deaf(self):
+        # Missing signal evidence is unknown, not proof that the listener is
+        # disconnected. Do not bounce/page on receipt staleness alone.
         self.assertEqual(
-            fd.verdict(snap(receipt_age_s=5500, sse_connected=None)), "DEAF")
+            fd.verdict(snap(receipt_age_s=5500, sse_connected=None)), "QUIET")
 
     def test_connected_but_stale_feed_is_quiet_not_deaf(self):
-        # Soak cycle 1 (2026-06-13): THREE false-positive bounces, the last at
-        # the raised 5400s line — an idle overnight channel legitimately sends
-        # nothing for hours, so a pure receipt-age threshold false-positives at
-        # ANY value. A listener whose SSE socket is up is QUIET, not deaf; only
-        # an actually-dropped socket is DEAF. (The half-open case — connected
-        # flag true but socket dead — needs the stream-activity clock from the
-        # monitor-hardening detector, task 9d1c13cb.)
+        # Soak cycle 1 showed idle channels can legitimately send nothing for
+        # hours. Only an explicitly dropped SSE socket is DEAF; receipt-age
+        # staleness alone remains QUIET.
         self.assertEqual(
             fd.verdict(snap(receipt_age_s=5500, sse_connected=True)), "QUIET")
+
 
     def test_quiet_evening_gap_is_not_deaf(self):
         self.assertEqual(fd.verdict(snap(receipt_age_s=3600)), "OK")
 
+    def test_quiet_when_connected_but_no_recent_receipt(self):
+        self.assertEqual(fd.verdict(snap(receipt_age_s=5500)), "QUIET")
+
+    def test_space_drift_has_its_own_verdict(self):
+        self.assertEqual(fd.verdict(snap(space_state="drift")), "SPACE")
+
+    def test_current_401_is_token_drift_even_before_expiry(self):
+        self.assertEqual(fd.verdict(snap(currently_401=True)), "TOKEN")
+
     def test_quiet_when_no_receipt_data_yet(self):
         self.assertEqual(fd.verdict(snap(receipt_age_s=None)), "QUIET")
+
+    def test_deaf_when_no_receipt_data_and_listener_disconnected(self):
+        self.assertEqual(fd.verdict(snap(receipt_age_s=None, sse_connected=False)), "DEAF")

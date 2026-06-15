@@ -7,11 +7,13 @@ Combines THREE views, because no single one tells the truth:
   2. LOCAL     (/proc + ss)               -> is the gateway process actually up,
                                               how many live :443 sockets
   3. RECEIPT   (logs/agent.log)           -> when did it LAST actually receive an
-                                              inbound mention  <-- the deaf detector
-                                              (read from the agent's OWN log, so it
-                                              is space-correct regardless of space)
+                                              inbound mention
+  4. DRIFT     (/proc env + token/signal)  -> token TTL/401 and live listener
+                                              space vs platform/agent-table space
 
-"Good" = process up + token valid + platform routable + received inbound recently.
+"Good" = process up + token valid + platform routable + recent receipt.
+Quiet != deaf: stale/no receipt is QUIET unless the listener is disconnected or
+currently 401/token-wedged.
 
 SPACE-AWARE: agents are GROUPED BY SPACE so cross-space agents are never confused
 for broken. An agent in a different space than peach's home will not answer a
@@ -21,7 +23,8 @@ under its own space header.
 """
 import json, os, subprocess, time, sys
 
-DEAF_AFTER_S = 30 * 60          # no inbound in 30m while "connected" => suspect deaf
+QUIET_AFTER_S = 30 * 60         # no inbound in 30m while connected => quiet, not deaf
+TOKEN_WEDGE_S = -600          # expired this long with process alive => token drift
 
 # ── Config (env-overridable so another operator can point this at their box) ──
 #   AX_FLEET_HOME      base dir holding agent homes        (default /home/ax-agents)
@@ -47,11 +50,11 @@ def platform_agents():
     return {a.get("name"): a for a in items if a.get("name")}
 
 def local_gateways():
-    """handle -> {pid, home, conns} for every running hermes gateway on this box."""
+    """handle -> live proc/env facts for every running hermes gateway here."""
     res = {}
     for pid in sh("pgrep -f 'gateway run'").split():
         try:
-            env = open(f"/proc/{pid}/environ").read().split("\0")
+            env = open(f"/proc/{pid}/environ", "rb").read().decode(errors="replace").split("\0")
         except Exception:
             continue
         e = dict(x.split("=", 1) for x in env if "=" in x)
@@ -59,7 +62,9 @@ def local_gateways():
         if not h:
             continue
         conns = sh(f"ss -tnp 2>/dev/null | grep -c 'pid={pid},'").strip()
-        res[h] = {"pid": pid, "home": e.get("HERMES_HOME", ""), "conns": conns}
+        res[h] = {"pid": pid, "home": e.get("HERMES_HOME", ""), "conns": conns,
+                  "token_file": e.get("AX_TOKEN_FILE", ""),
+                  "env_space": e.get("AX_SPACE_ID", "")}
     return res
 
 def agent_log(handle, home):
@@ -89,6 +94,42 @@ def last_inbound_age(log):
         return int(time.time() - t)
     except Exception:
         return None
+
+
+
+def token_ttl(token_file):
+    if not token_file:
+        return None
+    try:
+        with open(os.path.expanduser(token_file)) as f:
+            return int(json.load(f).get("expires_at", 0) - time.time())
+    except Exception:
+        return None
+
+def token_state(ttl):
+    if ttl is None: return "missing"
+    if ttl < TOKEN_WEDGE_S: return "wedged"
+    if ttl < 0: return "expired"
+    return "valid"
+
+def signal_state(handle):
+    try:
+        with open(os.path.expanduser(f"~/.ax/{handle}-signal.json")) as f:
+            d = json.load(f)
+        return {"sse_connected": d.get("connected"),
+                "currently_401": d.get("currently_401"),
+                "space_id": d.get("space_id"),
+                "last_mention_at": d.get("last_mention_at")}
+    except Exception:
+        return {"sse_connected": None, "currently_401": None,
+                "space_id": None, "last_mention_at": None}
+
+def compact_drift(expected_space, live_space):
+    if not live_space:
+        return "?"
+    if not expected_space:
+        return "space?"
+    return "space-ok" if str(expected_space) == str(live_space) else "SPACE-DRIFT"
 
 def fmt_age(s):
     if s is None: return "never"
@@ -130,34 +171,43 @@ def main():
         sname = next((plat[h].get("space_name") for h in handles if plat.get(h, {}).get("space_name")), None) or short(sid)
         tag = f"  ← {IDENTITY} home" if sid == peach_space else "  ← other space"
         print(f"SPACE  {sname}  ({short(sid)}){tag}")
-        print(f"  {'HANDLE':11}{'VERDICT':16}{'PID':8}{'CONN':6}{'PLAT_SSE':9}{'CTRL':9}{'LAST_INBOUND':13}")
+        print(f"  {'HANDLE':11}{'VERDICT':16}{'PID':8}{'CONN':6}{'PLAT_SSE':9}{'CTRL':9}{'LAST_IN':9}{'TOKEN':9}{'SPACE':12}")
         for h in handles:
             a = plat.get(h, {})
             l = loc.get(h)
             ctrl = (a.get("control") or {}).get("state", "?")
-            sse = a.get("sse_connected")
+            sig = signal_state(h)
+            sse = sig["sse_connected"] if sig["sse_connected"] is not None else a.get("sse_connected")
             age = last_inbound_age(agent_log(h, l["home"])) if l else None
-            # Uniform liveness: own-log receipt is space-correct for EVERY agent,
-            # so cross-space agents are judged (and healed) the same as home-space
-            # ones. Space grouping above is for visibility, not a different verdict.
+            ttl = token_ttl(l.get("token_file")) if l else None
+            tok = "401" if sig["currently_401"] else token_state(ttl)
+            live_space = sig["space_id"] or (l or {}).get("env_space")
+            drift = compact_drift(a.get("space_id"), live_space)
+            # Uniform liveness: own-log receipt is space-correct for EVERY agent.
+            # Receipt staleness alone is quiet, not deaf; token and space drift
+            # are separate verdicts.
             if ctrl == "disabled":
                 v = "DISABLED"
             elif not l:
                 v = "elsewhere" if a.get("connection_type") == "cli" else "down(local)"
-            elif age is not None and age <= DEAF_AFTER_S:
+            elif drift == "SPACE-DRIFT":
+                v = "SPACE-DRIFT"
+            elif tok in ("401", "wedged"):
+                v = "TOKEN-DRIFT"
+            elif age is not None and age <= QUIET_AFTER_S:
                 v = "✓ OK"
-            elif sse:
-                v = "⚠ SUSPECT-DEAF"
+            elif sse is False:
+                v = "DEAF"
             else:
-                v = "? unknown"
+                v = "QUIET"
             print(f"  {h:11}{v:16}{(l['pid'] if l else '-'):8}{(l['conns'] if l else '-'):6}"
-                  f"{str(sse):9}{str(ctrl):9}{fmt_age(age):13}")
+                  f"{str(sse):9}{str(ctrl):9}{fmt_age(age):9}{tok:9}{drift:12}")
         print()
 
-    print("legend: ✓OK=received inbound <30m (own-log receipt, space-correct) | "
-          "⚠SUSPECT-DEAF=up+sse but silent >30m, any space → bounce candidate | "
-          "elsewhere=cli agent not on this box | DISABLED=kill-switch")
-    print("note: agents are grouped by space for visibility; liveness is judged the SAME in every space.")
+    print("legend: ✓OK=received inbound <30m | QUIET=connected/no recent inbound (not a failure) | "
+          "DEAF=local listener not connected | TOKEN-DRIFT=401/wedged token | "
+          "SPACE-DRIFT=listener space differs from platform space | DISABLED=kill-switch")
+    print("note: agents are grouped by platform space; drift/token/receipt dimensions stay separate.")
 
 if __name__ == "__main__":
     main()

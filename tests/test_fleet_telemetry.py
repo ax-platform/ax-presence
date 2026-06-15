@@ -45,11 +45,12 @@ class RuntimeShapeTest(unittest.TestCase):
         with open(sig, "w") as f:
             json.dump({"handle": "a", "ts": 5000, "connected": True,
                        "currently_401": False, "mentions_seen": 142,
+                       "last_mention_at": 4988, "space_id": "space-a",
                        "replies_sent": 131, "last_reply_at": 4990,
                        "responsiveness_ratio": 0.923}, f)
         cfg = {"fleet": {"device": "laptop"},
                "agents": {"a": {"token_file": tok, "heartbeat_file": hb,
-                                "signal_file": sig}}}
+                                "signal_file": sig, "space_id": "space-a"}}}
         agents = {"a": _StubProc("a", log)}
         ctx = fd.new_ctx(cfg, agents, token=None,
                          state_file=os.path.join(d, "state.json"),
@@ -68,13 +69,19 @@ class RuntimeShapeTest(unittest.TestCase):
         self.assertEqual(snap["verdict"], "OK")
         self.assertIs(snap["sse_connected"], True)
         self.assertEqual(snap["mentions_seen"], 142)
+        self.assertEqual(snap["last_mention_at"], 4988)
         self.assertEqual(snap["replies_sent"], 131)
         self.assertIs(snap["currently_401"], False)
+        self.assertEqual(snap["token_state"], "valid")
+        self.assertEqual(snap["listener_space_id"], "space-a")
+        self.assertEqual(snap["expected_space_id"], "space-a")
+        self.assertEqual(snap["space_state"], "ok")
 
     def test_heartbeat_fields_default_to_none_when_file_missing(self):
         hb = fd.read_heartbeat("/nonexistent/heartbeat.json")
         self.assertEqual(hb, {"sse_connected": None, "mentions_seen": None,
-                              "replies_sent": None, "currently_401": None})
+                              "replies_sent": None, "currently_401": None,
+                              "last_mention_at": None, "space_id": None})
 
 class TelemetryBuildTest(unittest.TestCase):
     def test_matches_golden_contract(self):
@@ -88,7 +95,10 @@ class TelemetryBuildTest(unittest.TestCase):
             agent_snaps={"claude_prime": {
                 "verdict": "OK", "pid": 4411, "sse_connected": True,
                 "last_receipt_age_s": 38, "token_ttl_s": 660,
-                "mentions_seen": 142, "replies_sent": 131, "currently_401": False}},
+                "token_state": "valid", "mentions_seen": 142,
+                "last_mention_at": 4990, "replies_sent": 131,
+                "currently_401": False, "listener_space_id": "space-a",
+                "expected_space_id": "space-a", "space_state": "ok"}},
             events=[{"kind": "suspend_resumed", "for_s": 41020, "tokens_refreshed": 3},
                     {"kind": "bounce", "agent": "night_owl", "reason": "DEAF",
                      "result": "receipt_fresh"}])

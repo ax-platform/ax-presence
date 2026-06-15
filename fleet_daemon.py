@@ -135,7 +135,9 @@ def read_heartbeat(path):
     return {"sse_connected": hb.get("connected"),
             "mentions_seen": hb.get("mentions_seen"),
             "replies_sent": hb.get("replies_sent"),
-            "currently_401": hb.get("currently_401")}
+            "currently_401": hb.get("currently_401"),
+            "last_mention_at": hb.get("last_mention_at"),
+            "space_id": hb.get("space_id")}
 
 
 def child_env(name, cfg):
@@ -190,6 +192,28 @@ def token_ttl(token_file, now):
         return None
 
 
+def token_state(ttl_s):
+    if ttl_s is None:
+        return "missing"
+    if ttl_s < TOKEN_WEDGE_S:
+        return "wedged"
+    if ttl_s < 0:
+        return "expired"
+    return "valid"
+
+
+def space_state(expected_space_id, listener_space_id):
+    """Compare read-only listener-reported placement against expected placement.
+
+    The daemon must not seed AX_SPACE_ID into children, but it may report drift
+    when an operator provides the backend/agent-table space in fleet.toml (for
+    example `space_id = "..."`). Missing data is unknown, not healthy proof.
+    """
+    if not expected_space_id or not listener_space_id:
+        return "unknown"
+    return "ok" if str(expected_space_id) == str(listener_space_id) else "drift"
+
+
 def stamp_line(line, now):
     return f"{int(now)} {line}"
 
@@ -220,19 +244,20 @@ def verdict(s):
         return "CRASHLOOP"
     if not s["alive"]:
         return "DOWN"
-    if s["token_ttl_s"] is not None and s["token_ttl_s"] < TOKEN_WEDGE_S:
+    if s.get("space_state") == "drift":
+        return "SPACE"
+    if s.get("currently_401") or token_state(s.get("token_ttl_s")) == "wedged":
         return "TOKEN"
     if s["receipt_age_s"] is None:
-        return "QUIET"
+        return "DEAF" if s.get("sse_connected") is False else "QUIET"
     if s["receipt_age_s"] > DEAF_THRESHOLD_S:
-        # A connected listener with a stale mention feed is QUIET, not deaf:
-        # an idle overnight channel legitimately sends nothing for hours, so a
-        # pure receipt-age threshold false-positives at ANY value (soak cycle 1
-        # bounced three times, the last at the raised 5400s line). Only an
-        # actually-dropped SSE socket (sse_connected false/None) is DEAF. The
-        # half-open case — connected flag true but socket dead — needs the
-        # stream-activity clock from the monitor-hardening detector (9d1c13cb).
-        return "DEAF" if not s["sse_connected"] else "QUIET"
+        # Receipt staleness alone is not proof of deafness: an agent may simply
+        # have had no expected traffic. Only call it DEAF when the listener's
+        # own signal explicitly says SSE is disconnected; otherwise classify as
+        # QUIET so the monitor does not bounce/page quiet agents as broken.
+        # The half-open case (connected flag true but socket dead) needs a
+        # separate stream-activity clock, not a receipt-age inference.
+        return "DEAF" if s.get("sse_connected") is False else "QUIET"
     return "OK"
 
 
@@ -406,7 +431,9 @@ def daemon_tick(ctx, mono_now, wall_now):
             ag.spawn()
             ag.next_spawn_at = None
 
-    # Fresh snapshots (token_ttl read-only, last_receipt_age, alive) -> verdicts.
+    # Fresh snapshots (token_ttl read-only, last_receipt_age, alive,
+    # listener signal) -> verdicts. Keep the dimensions separate: quiet
+    # agents are not deaf, token drift is not space drift.
     snaps = {}
     for name, ag in agents.items():
         a = cfg["agents"][name]
@@ -414,15 +441,20 @@ def daemon_tick(ctx, mono_now, wall_now):
         # file is just a bare-int liveness epoch); legacy dict-format
         # heartbeat files still fill any field the signal file doesn't.
         # Read it BEFORE the verdict: sse_connected gates DEAF (a connected
-        # listener with a quiet feed is QUIET, not deaf).
+        # listener with a quiet feed is QUIET, not deaf), while token and space
+        # drift remain separate verdict dimensions.
         sig = read_heartbeat(signal_path(name, a))
         legacy = read_heartbeat(heartbeat_path(name, a))
         hb = {k: legacy[k] if sig[k] is None else sig[k] for k in sig}
+        tok_ttl = token_ttl(a["token_file"], wall_now)
+        sp_state = space_state(a.get("space_id"), hb.get("space_id"))
         s = {"alive": ag.alive(), "disabled": bool(a.get("disabled")),
              "crashloop": is_crashloop(ag.failure_times, wall_now),
-             "token_ttl_s": token_ttl(a["token_file"], wall_now),
+             "token_ttl_s": tok_ttl,
              "receipt_age_s": last_receipt_age(ag.log_path, wall_now),
-             "sse_connected": hb["sse_connected"]}
+             "sse_connected": hb["sse_connected"],
+             "currently_401": hb["currently_401"],
+             "space_state": sp_state}
         v = verdict(s)
         if in_grace and v in ("DEAF", "TOKEN"):
             # Stale receipts AND long-expired tokens are expected right after
@@ -457,9 +489,14 @@ def daemon_tick(ctx, mono_now, wall_now):
                        "sse_connected": hb["sse_connected"],
                        "last_receipt_age_s": s["receipt_age_s"],
                        "token_ttl_s": s["token_ttl_s"],
+                       "token_state": token_state(s["token_ttl_s"]),
                        "mentions_seen": hb["mentions_seen"],
+                       "last_mention_at": hb["last_mention_at"],
                        "replies_sent": hb["replies_sent"],
-                       "currently_401": hb["currently_401"]}
+                       "currently_401": hb["currently_401"],
+                       "listener_space_id": hb["space_id"],
+                       "expected_space_id": a.get("space_id"),
+                       "space_state": sp_state}
 
     if ctx["tick"] % TELEMETRY_EVERY:
         return None
